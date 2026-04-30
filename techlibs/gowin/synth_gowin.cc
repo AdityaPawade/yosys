@@ -44,6 +44,12 @@ struct SynthGowinPass : public ScriptPass
 		{9, 9, 4, 4, "$__MUL9X9"},
 	};
 
+	// gw5a chips have a different DSP block layout: MULT12X12 and MULT27X36 (with optional addend D)
+	const std::vector<DSPRule> dsp_rules_gw5a = {
+		{27, 36, 13, 13, "$__MUL27X36"},
+		{12, 12, 4, 4, "$__MUL12X12"},
+	};
+
 	void help() override
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
@@ -290,6 +296,13 @@ struct SynthGowinPass : public ScriptPass
 					run("chtype -set $mul t:$__soft_mul");
 				}
 				run("techmap -map +/gowin/dsp_map.v");
+			} else if (!nodsp && family == "gw5a") {
+				for (const auto &rule : dsp_rules_gw5a) {
+					run(stringf("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=%d -D DSP_B_MAXWIDTH=%d -D DSP_A_MINWIDTH=%d -D DSP_B_MINWIDTH=%d -D DSP_NAME=%s",
+						rule.a_maxwidth, rule.b_maxwidth, rule.a_minwidth, rule.b_minwidth, rule.prim));
+					run("chtype -set $mul t:$__soft_mul");
+				}
+				run("techmap -map +/gowin/dsp_map_gw5a.v");
 			}
 
 			run("alumacc");
