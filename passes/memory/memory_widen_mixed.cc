@@ -162,14 +162,45 @@ struct MemoryWidenMixedWorker {
 				SigSpec wide_data;
 				SigSpec wide_en;
 				SigSpec slot_sel = lo_addr.extract(L, K - L);
+
+				// Determine if narrow_en is "uniform" (all bits same signal).  If so,
+				// we can produce a clean byte-en pattern: each slot has narrow_width
+				// bits of EN that are all the same bit (slot_match AND narrow_en[0]).
+				// That lets libmap recognise the byte-enable structure and use a
+				// single wide BSRAM cell instead of one cell per bit lane.
+				bool en_uniform = true;
+				if (GetSize(narrow_en) > 0) {
+					SigBit b0 = narrow_en[0];
+					for (int b = 1; b < narrow_width; b++) {
+						if (narrow_en[b] != b0) { en_uniform = false; break; }
+					}
+				}
+
 				for (int slot = 0; slot < n_slots; slot++) {
 					wide_data.append(narrow_data);
 					SigSpec slot_match = module->Eq(NEW_ID, slot_sel, Const(slot, K - L));
-					SigSpec slot_match_rep;
-					for (int b = 0; b < narrow_width; b++)
-						slot_match_rep.append(slot_match);
-					SigSpec slot_en = module->And(NEW_ID, narrow_en, slot_match_rep);
-					wide_en.append(slot_en);
+					if (en_uniform) {
+						// Single-bit EN: combine narrow_en[0] with slot_match,
+						// then replicate that ONE bit across narrow_width.  libmap
+						// should now see narrow_width identical EN bits per slot
+						// = a clean byte-en structure.
+						SigBit eff_en;
+						if (narrow_en[0] == State::S1) {
+							eff_en = SigSpec(slot_match)[0];
+						} else {
+							SigSpec g = module->And(NEW_ID, slot_match, SigSpec(narrow_en[0]));
+							eff_en = g[0];
+						}
+						for (int b = 0; b < narrow_width; b++)
+							wide_en.append(eff_en);
+					} else {
+						// Mixed EN signals — fall back to per-bit AND.
+						SigSpec slot_match_rep;
+						for (int b = 0; b < narrow_width; b++)
+							slot_match_rep.append(slot_match);
+						SigSpec slot_en = module->And(NEW_ID, narrow_en, slot_match_rep);
+						wide_en.append(slot_en);
+					}
 				}
 				wr.data = wide_data;
 				wr.en = wide_en;
