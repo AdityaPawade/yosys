@@ -321,7 +321,7 @@ struct SynthGowinPass : public ScriptPass
 				// Multiple passes catch transitive merges as new ports get widened.
 				run("memory_share -nosat");
 				run("memory_share -nosat");
-				run("memory_async2sync -min-bits 1024 -max-ports 50");
+				run("memory_widen_mixed -min-bits 4096 -target-log2 2"); run("memory_fold_reads -min-bits 4096"); run("memory_async2sync -min-bits 1024 -max-ports 16");
 				run("memory_collect");
 			}
 			std::string args = "";

@@ -14,3 +14,5 @@ OBJS += passes/memory/memory_bmux2rom.o
 
 OBJS += passes/memory/memlib.o
 OBJS += passes/memory/memory_async2sync.o
+OBJS += passes/memory/memory_widen_mixed.o
+OBJS += passes/memory/memory_fold_reads.o
