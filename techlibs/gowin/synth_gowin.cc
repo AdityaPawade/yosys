@@ -46,7 +46,7 @@ struct SynthGowinPass : public ScriptPass
 
 	// gw5a chips have a different DSP block layout: MULT12X12 and MULT27X36 (with optional addend D)
 	const std::vector<DSPRule> dsp_rules_gw5a = {
-		{27, 36, 13, 13, "$__MUL27X36"},
+		{27, 36, 4, 4, "$__MUL27X36"},
 		{12, 12, 4, 4, "$__MUL12X12"},
 	};
 
