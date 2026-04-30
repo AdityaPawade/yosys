@@ -106,8 +106,11 @@ struct MemoryShareWorker
 					if (port1.clk_polarity != port2.clk_polarity)
 						continue;
 				}
-				if (port1.en != port2.en)
-					continue;
+				// Allow EN mismatch — OR the enables instead of bailing.
+				// For read ports this is safe: both consumers see the data slice
+				// they need at their original address; the OR'd EN means the
+				// (now-shared) port is active when EITHER consumer needed a read.
+				bool en_differs = (port1.en != port2.en);
 				if (port1.arst != port2.arst)
 					continue;
 				if (port1.srst != port2.srst)
@@ -174,6 +177,11 @@ struct MemoryShareWorker
 					port1.srst_value = srst_value;
 					port1.wide_log2 = wide_log2;
 					port1.data = new_data;
+					if (en_differs) {
+						// OR the two enables so the shared port is active when
+						// either original consumer wanted to read.
+						port1.en = module->Or(NEW_ID, port1.en, port2.en);
+					}
 					port2.removed = true;
 					changed = true;
 				}

@@ -54,13 +54,14 @@ PRIVATE_NAMESPACE_BEGIN
 struct MemoryAsync2SyncWorker {
 	Module *module;
 	int min_bits;
+	int max_ports;
 	pool<IdString> only_mem;
 
 	int memories_transformed = 0;
 	int ports_transformed = 0;
 
-	MemoryAsync2SyncWorker(Module *m, int mb, pool<IdString> om)
-		: module(m), min_bits(mb), only_mem(om) {}
+	MemoryAsync2SyncWorker(Module *m, int mb, int mp, pool<IdString> om)
+		: module(m), min_bits(mb), max_ports(mp), only_mem(om) {}
 
 	// Find a clock signal we can use to register an async port. Strategy:
 	//   1. If any write port is clocked, take its clk + polarity.
@@ -100,6 +101,17 @@ struct MemoryAsync2SyncWorker {
 			}
 
 			if (!wanted) continue;
+
+			// Skip memories with very high port count — promoting them all to
+			// sync overwhelms memory_libmap's per-port analysis (OOMs Pi 5).
+			// Without promotion they just stay in FF mapping (no worse than
+			// today).
+			int total_ports = (int)mem.rd_ports.size() + (int)mem.wr_ports.size();
+			if (max_ports > 0 && total_ports > max_ports) {
+				log("skipping memory %s.%s: %d ports > -max-ports %d.\n",
+					log_id(module), log_id(mem.memid), total_ports, max_ports);
+				continue;
+			}
 
 			// Skip memories with no async read ports (already fully sync).
 			bool any_async = false;
@@ -182,11 +194,16 @@ struct MemoryAsync2SyncPass : public Pass {
 		log_header(design, "Executing MEMORY_ASYNC2SYNC pass.\n");
 
 		int min_bits = 1024;
+		int max_ports = 0;  // 0 = unlimited
 		pool<IdString> only_mem;
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-min-bits" && argidx + 1 < args.size()) {
 				min_bits = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-max-ports" && argidx + 1 < args.size()) {
+				max_ports = atoi(args[++argidx].c_str());
 				continue;
 			}
 			if (args[argidx] == "-only-mem" && argidx + 1 < args.size()) {
@@ -211,7 +228,7 @@ struct MemoryAsync2SyncPass : public Pass {
 
 		int total_mems = 0, total_ports = 0;
 		for (auto mod : design->selected_modules()) {
-			MemoryAsync2SyncWorker worker(mod, min_bits, only_mem);
+			MemoryAsync2SyncWorker worker(mod, min_bits, max_ports, only_mem);
 			worker.run();
 			total_mems += worker.memories_transformed;
 			total_ports += worker.ports_transformed;

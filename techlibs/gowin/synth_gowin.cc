@@ -313,6 +313,17 @@ struct SynthGowinPass : public ScriptPass
 
 		if (check_label("map_ram"))
 		{
+			// gw5a-25: extra port consolidation + async-to-sync promotion before
+			// memory_libmap.  -nosat avoids SAT-based write-port sharing OOM that
+			// can hit on designs with many small memrd_v2 cells.
+			if (family == "gw5a") {
+				// Extra port consolidation rounds (memory_share now OR'es enables).
+				// Multiple passes catch transitive merges as new ports get widened.
+				run("memory_share -nosat");
+				run("memory_share -nosat");
+				run("memory_async2sync -min-bits 1024 -max-ports 50");
+				run("memory_collect");
+			}
 			std::string args = "";
 			if (help_mode)
 				args += " [-no-auto-block] [-no-auto-distributed]";
@@ -323,8 +334,12 @@ struct SynthGowinPass : public ScriptPass
 					args += " -no-auto-distributed";
 			}
 			if (family == "gw5a") {
-				// gw5a has no SSRAM; map only to BSRAM, don't include lutrams.txt
-				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
+				// gw5a has no SSRAM; map only to BSRAM, don't include lutrams.txt.
+				// Bias toward BRAM with -logic-cost-ram 4: makes FF mapping 8x more
+				// expensive per bit, so any memory >= ~16 bits prefers BRAM if a
+				// matching cell exists.  Saves DFFs for designs with many small
+				// memories.
+				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a -logic-cost-ram 4%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
 				run("techmap -map +/gowin/brams_map_gw5a.v");
 			} else {
 				run(stringf("memory_libmap -lib +/gowin/lutrams.txt -lib +/gowin/brams.txt%s", args.c_str()), "(-no-auto-block if -nobram, -no-auto-distributed if -nolutram)");
