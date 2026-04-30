@@ -319,11 +319,17 @@ struct SynthGowinPass : public ScriptPass
 			else {
 				if (nobram)
 					args += " -no-auto-block";
-				if (nolutram)
+				if (nolutram || family == "gw5a")  // gw5a has no SSRAM (apicula tile_types['M'] is empty)
 					args += " -no-auto-distributed";
 			}
-			run(stringf("memory_libmap -lib +/gowin/lutrams.txt -lib +/gowin/brams.txt%s", family == "gw5a" ? " -D gw5a" : "") + args, "(-no-auto-block if -nobram, -no-auto-distributed if -nolutram)");
-			run(stringf("techmap -map +/gowin/lutrams_map.v -map +/gowin/brams_map%s.v", family == "gw5a" ? "_gw5a" : ""));
+			if (family == "gw5a") {
+				// gw5a has no SSRAM; map only to BSRAM, don't include lutrams.txt
+				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
+				run("techmap -map +/gowin/brams_map_gw5a.v");
+			} else {
+				run(stringf("memory_libmap -lib +/gowin/lutrams.txt -lib +/gowin/brams.txt%s", args.c_str()), "(-no-auto-block if -nobram, -no-auto-distributed if -nolutram)");
+				run("techmap -map +/gowin/lutrams_map.v -map +/gowin/brams_map.v");
+			}
 		}
 
 		if (check_label("map_ffram"))
