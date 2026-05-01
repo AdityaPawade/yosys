@@ -321,7 +321,7 @@ struct SynthGowinPass : public ScriptPass
 				// Multiple passes catch transitive merges as new ports get widened.
 				run("memory_share -nosat");
 				run("memory_share -nosat");
-				run("memory_widen_mixed -only-mem rdr_reader_inst.sector_buffer,fdr_reader_inst.sector_buffer -target-log2 2"); run("memory_share -nosat"); run("memory_share -nosat"); run("memory_fold_reads -min-bits 4096"); run("memory_async2sync -min-bits 1024 -max-ports 16");
+				run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2"); run("memory_share -nosat"); run("memory_share -nosat"); run("memory_fold_reads -min-bits 4096"); run("memory_async2sync -min-bits 1024 -max-ports 20");
 				run("memory_collect");
 			}
 			std::string args = "";
@@ -338,7 +338,9 @@ struct SynthGowinPass : public ScriptPass
 				// Bias toward BRAM with -logic-cost-ram 4: makes FF mapping 8x more
 				// expensive per bit, so any memory >= ~16 bits prefers BRAM if a
 				// matching cell exists.  Saves DFFs for designs with many small
-				// memories.
+				// memories.  Demote small (cpuregs etc.) to FF mapping first to free
+				// BSRAM cells so the placer has slack on tight designs.
+				run("memory_demote_small -max-bits 2048", "(set ram_style=logic on memories under N bits, BEFORE libmap)");
 				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a -logic-cost-ram 4%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
 				run("techmap -map +/gowin/brams_map_gw5a.v");
 			} else {

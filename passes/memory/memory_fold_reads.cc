@@ -81,8 +81,8 @@ struct MemoryFoldReadsWorker {
 				SigBit cur = q.front(); q.pop();
 				if (!bit_to_consumers.count(cur)) continue;
 				for (auto cell : bit_to_consumers.at(cur)) {
-					// $mux/$pmux: data on A or B → S is the active signal.
-					if (cell->type == ID($mux) || cell->type == ID($pmux)) {
+					// $mux: data on A or B → S is the active signal.
+					if (cell->type == ID($mux)) {
 						SigSpec s = cell->getPort(ID::S);
 						if (GetSize(s) != 1) continue;
 						SigSpec a = cell->getPort(ID::A);
@@ -93,6 +93,37 @@ struct MemoryFoldReadsWorker {
 						if (!data_in_a && !data_in_b) continue;
 						if (data_in_b) return SigSpec(s);
 						else return module->Not(NEW_ID, SigSpec(s));
+					}
+					// $pmux: Y = case S of B[0..W-1]; else A.  If data feeds B[k*W..(k+1)*W-1]
+					// for some k, that "case" is selected when S[k]=1 → active = S[k].
+					if (cell->type == ID($pmux)) {
+						SigSpec s = cell->getPort(ID::S);
+						SigSpec a = cell->getPort(ID::A);
+						SigSpec by = cell->getPort(ID::B);
+						int W = GetSize(a);
+						int N = GetSize(s);
+						if (N < 1 || GetSize(by) != W * N) continue;
+						// Find which B-slot contains our `cur` bit.
+						int found_k = -1;
+						SigSpec by_mapped = sigmap(by);
+						for (int k = 0; k < N; k++) {
+							for (int b = 0; b < W; b++) {
+								if (by_mapped[k * W + b] == cur) { found_k = k; break; }
+							}
+							if (found_k >= 0) break;
+						}
+						if (found_k >= 0) {
+							return SigSpec(s[found_k]);
+						}
+						// Maybe data feeds A (default case).  Active = !|S (none of cases match).
+						SigSpec a_mapped = sigmap(a);
+						bool in_a = false;
+						for (auto &x : a_mapped) if (x == cur) { in_a = true; break; }
+						if (in_a) {
+							SigSpec or_s = module->ReduceOr(NEW_ID, s);
+							return module->Not(NEW_ID, or_s);
+						}
+						continue;
 					}
 					// FF with EN: that EN gates capture of this data.
 					if (cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff), ID($sdffe))) {
