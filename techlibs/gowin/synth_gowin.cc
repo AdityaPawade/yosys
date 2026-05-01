@@ -340,7 +340,8 @@ struct SynthGowinPass : public ScriptPass
 				// matching cell exists.  Saves DFFs for designs with many small
 				// memories.  Demote small (cpuregs etc.) to FF mapping first to free
 				// BSRAM cells so the placer has slack on tight designs.
-				run("memory_demote_small -max-bits 2048", "(set ram_style=logic on memories under N bits, BEFORE libmap)");
+				run("memory_demote_small -max-bits 2048", "(demote small memories <N bits to FF mapping, BEFORE libmap)");
+				run("memory_demote_small -only-mem mbr_reader_inst.sector_buffer", "(also demote mbr to free BSRAM cells for placement slack)");
 				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a -logic-cost-ram 4%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
 				run("techmap -map +/gowin/brams_map_gw5a.v");
 			} else {
