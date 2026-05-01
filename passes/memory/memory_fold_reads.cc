@@ -21,6 +21,7 @@
 #include "kernel/yosys.h"
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
+#include <queue>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -60,27 +61,61 @@ struct MemoryFoldReadsWorker {
 	// (heuristically) decides whether this port's read result is observed.
 	SigSpec extract_active_signal(SigSpec data) {
 		if (data.empty()) return SigSpec();
-		// Sample one bit of data — the consumer is typically the same for all bits.
+		// BFS through consumer cells starting at data[0], looking for either
+		//   - a $mux/$pmux gated by a single-bit S (use S as active signal); or
+		//   - a $dffe/$dff with EN (use EN).
+		// Walk through pass-through cells ($shiftx, $shift, simple bitops) so
+		// reads that go through byte-extract logic before hitting a state
+		// mux can still be folded.
 		SigBit b0 = sigmap(data[0]);
 		if (!bit_to_consumers.count(b0)) return SigSpec();
-		for (auto cell : bit_to_consumers.at(b0)) {
-			if (cell->type != ID($mux)) continue;
-			SigSpec s = cell->getPort(ID::S);
-			if (GetSize(s) != 1) continue;
-			// Confirm that data[0] really feeds A or B (and not S).
-			SigSpec a = cell->getPort(ID::A);
-			SigSpec by = cell->getPort(ID::B);
-			bool data_in_a = false, data_in_b = false;
-			for (auto &x : sigmap(a)) if (x == b0) { data_in_a = true; break; }
-			for (auto &x : sigmap(by)) if (x == b0) { data_in_b = true; break; }
-			if (!data_in_a && !data_in_b) continue;
-			// We found a $mux gated by `s`.  Return s as the active signal.
-			// If data is on the B input, the mux is "if S then read-data else other"
-			// → S being high means our read is observed.  If on A, S being LOW.
-			// Either way `s` is the gating bit; we use it directly (the caller's
-			// fallback default address handles the inactive case).
-			if (data_in_b) return SigSpec(s);
-			else return module->Not(NEW_ID, SigSpec(s));
+		pool<SigBit> visited;
+		std::queue<SigBit> q;
+		q.push(b0);
+		visited.insert(b0);
+		const int max_depth = 6;
+		int depth = 0;
+		while (!q.empty() && depth < max_depth) {
+			int sz = (int)q.size();
+			for (int i = 0; i < sz; i++) {
+				SigBit cur = q.front(); q.pop();
+				if (!bit_to_consumers.count(cur)) continue;
+				for (auto cell : bit_to_consumers.at(cur)) {
+					// $mux/$pmux: data on A or B → S is the active signal.
+					if (cell->type == ID($mux) || cell->type == ID($pmux)) {
+						SigSpec s = cell->getPort(ID::S);
+						if (GetSize(s) != 1) continue;
+						SigSpec a = cell->getPort(ID::A);
+						SigSpec by = cell->getPort(ID::B);
+						bool data_in_a = false, data_in_b = false;
+						for (auto &x : sigmap(a)) if (x == cur) { data_in_a = true; break; }
+						for (auto &x : sigmap(by)) if (x == cur) { data_in_b = true; break; }
+						if (!data_in_a && !data_in_b) continue;
+						if (data_in_b) return SigSpec(s);
+						else return module->Not(NEW_ID, SigSpec(s));
+					}
+					// FF with EN: that EN gates capture of this data.
+					if (cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff), ID($sdffe))) {
+						if (cell->hasPort(ID::EN)) {
+							SigSpec en = cell->getPort(ID::EN);
+							if (GetSize(en) == 1) return SigSpec(en);
+						}
+					}
+					// Pass-through: chase Y output forward.
+					if (cell->type.in(ID($shiftx), ID($shift), ID($not), ID($pos), ID($neg),
+					                   ID($logic_not), ID($and), ID($or), ID($xor), ID($xnor),
+					                   ID($reduce_or), ID($reduce_and), ID($reduce_xor),
+					                   ID($add), ID($sub), ID($eq), ID($ne), ID($lt), ID($le),
+					                   ID($gt), ID($ge), ID($bmux), ID($demux))) {
+						if (cell->hasPort(ID::Y)) {
+							for (auto &b : sigmap(cell->getPort(ID::Y))) {
+								if (visited.insert(b).second) q.push(b);
+							}
+						}
+					}
+				}
+			}
+			depth++;
 		}
 		return SigSpec();
 	}
