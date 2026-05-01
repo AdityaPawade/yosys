@@ -1,6 +1,6 @@
 ram block $__GOWIN_SP_ {
 	abits 14;
-	widths 1 2 4 9 18 36 per_port;
+	widths 9 18 36 per_port;
 	cost 128;
 	byte 9;
 	init no_undef;
@@ -57,7 +57,7 @@ ram block $__GOWIN_DP_ {
 
 ram block $__GOWIN_SDP_ {
 	abits 14;
-	widths 1 2 4 9 18 36 per_port;
+	widths 9 18 36 per_port;
 	cost 128;
 	byte 9;
 	init no_undef;
