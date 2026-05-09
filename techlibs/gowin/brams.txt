@@ -58,7 +58,13 @@ ram block $__GOWIN_DP_ {
 ram block $__GOWIN_SDP_ {
 	abits 14;
 	widths 9 18 36 per_port;
-	cost 128;
+	# 2026-05-10 Phase 10 — Gowin EDA proof point: GowinSynthesis maps the
+	# multi-port FDR sector_buffer to SDPB (Semi-Dual-Port) primitives, NOT
+	# DPB/DPX9B. SDP has clean port semantics (1R + 1W), no ambiguous
+	# bidirectional roles across replicas. We bias libmap toward SDP first
+	# by halving the cost vs DP/SP. True dual-port memories (which SDP
+	# cannot represent) still fall through to $__GOWIN_DP_.
+	cost 64;
 	byte 9;
 	init no_undef;
 	port sr "R" {
