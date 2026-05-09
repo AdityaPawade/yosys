@@ -128,9 +128,44 @@ struct MemoryAsync2SyncWorker {
 				continue;
 			}
 
+			// R39e (2026-05-10): pre-scan for common srst/arst across sibling sync ports.
+			// Without this, libmap wires zero-srst replicas' RESETB to GND, holding
+			// their output registers in reset on hardware -> reads return 0.
+			// Use is_fully_zero() not == State::S0 for multi-bit SigSpec compare.
+			SigSpec common_srst = State::S0;
+			bool have_common_srst = false;
+			SigSpec common_arst = State::S0;
+			bool have_common_arst = false;
+			for (auto &rd : mem.rd_ports) {
+				if (!rd.clk_enable) continue;
+				if (!have_common_srst && !rd.srst.is_fully_zero()) {
+					common_srst = rd.srst;
+					have_common_srst = true;
+				}
+				if (!have_common_arst && !rd.arst.is_fully_zero()) {
+					common_arst = rd.arst;
+					have_common_arst = true;
+				}
+				if (have_common_srst && have_common_arst) break;
+			}
+
 			bool changed = false;
 			for (auto &rd : mem.rd_ports) {
-				if (rd.clk_enable) continue;
+				if (rd.clk_enable) {
+					// R39e: normalize already-sync zero-srst/zero-arst ports
+					// to the common signal so their replicas don't get RESETB=GND.
+					if (have_common_srst && rd.srst.is_fully_zero()) {
+						rd.srst = common_srst;
+						rd.srst_value = Const(State::S0, mem.width << rd.wide_log2);
+						changed = true;
+					}
+					if (have_common_arst && rd.arst.is_fully_zero()) {
+						rd.arst = common_arst;
+						rd.arst_value = Const(State::S0, mem.width << rd.wide_log2);
+						changed = true;
+					}
+					continue;
+				}
 
 				// Mark port as sync.  The $mem_v2 cell's own internal output
 				// register absorbs the 1-cycle latency (yosys-libmap's
@@ -142,6 +177,15 @@ struct MemoryAsync2SyncWorker {
 				rd.clk = clk;
 				rd.clk_polarity = clk_polarity;
 				rd.ce_over_srst = false;
+				// R39e: inherit common srst/arst on promoted ports too.
+				if (have_common_srst) {
+					rd.srst = common_srst;
+					rd.srst_value = Const(State::S0, mem.width << rd.wide_log2);
+				}
+				if (have_common_arst) {
+					rd.arst = common_arst;
+					rd.arst_value = Const(State::S0, mem.width << rd.wide_log2);
+				}
 
 				ports_transformed++;
 				changed = true;
