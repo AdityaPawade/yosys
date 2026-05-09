@@ -210,7 +210,16 @@ wire [13:0] ADB = `addrbe(PORT_B_WIDTH, PORT_B_ADDR, PORT_B_WR_BE);
 
 generate
 
-if (PORT_A_WIDTH < 9 || PORT_B_WIDTH < 9) begin
+// Codex round 19 follow-up (EXP_BB): broaden the DPB (8-bit-via-x8-packing)
+// branch to also handle 9-bit memories. yosys's libmap pads our 8-bit
+// `logic [7:0] sector_buffer [0:511]` to 9 bits (since brams.txt lists
+// supported widths {1,2,4,9,18} — no native 8). Default condition was
+// `< 9` (DPB only for narrow widths), so 9-bit memories went to DPX9B.
+// Forcing `<= 9` puts our 8-bit-padded-to-9 memory through DPB instead.
+// DPB packs 8 bits per cell (bit 8 unused). Diagnostic-only override (not
+// gated): if EXP_BB hardware works while EXP_Z does not, the bug is
+// specifically in DPX9B's narrow-write path on GW5A.
+if (PORT_A_WIDTH <= 9 || PORT_B_WIDTH <= 9) begin
 
 	wire [15:0] DIA = `x8_wr_data(PORT_A_WR_DATA);
 	wire [15:0] DIB = `x8_wr_data(PORT_B_WR_DATA);

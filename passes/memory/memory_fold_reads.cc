@@ -22,6 +22,7 @@
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
 #include <queue>
+#include <cstdlib>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -31,6 +32,8 @@ struct MemoryFoldReadsWorker {
 	int min_bits;
 	int min_ports;
 	pool<IdString> only_mem;
+	bool aggressive;
+	int active_search_depth;
 
 	// SigMap to canonicalise signals before lookup.
 	SigMap sigmap;
@@ -40,8 +43,9 @@ struct MemoryFoldReadsWorker {
 	int memories_folded = 0;
 	int ports_eliminated = 0;
 
-	MemoryFoldReadsWorker(Module *m, int mb, int mp, pool<IdString> om)
-		: module(m), min_bits(mb), min_ports(mp), only_mem(om), sigmap(m) {
+	MemoryFoldReadsWorker(Module *m, int mb, int mp, pool<IdString> om, bool aggr, int depth)
+		: module(m), min_bits(mb), min_ports(mp), only_mem(om),
+		  aggressive(aggr), active_search_depth(depth), sigmap(m) {
 		build_consumer_index();
 	}
 
@@ -73,9 +77,8 @@ struct MemoryFoldReadsWorker {
 		std::queue<SigBit> q;
 		q.push(b0);
 		visited.insert(b0);
-		const int max_depth = 6;
 		int depth = 0;
-		while (!q.empty() && depth < max_depth) {
+		while (!q.empty() && depth < active_search_depth) {
 			int sz = (int)q.size();
 			for (int i = 0; i < sz; i++) {
 				SigBit cur = q.front(); q.pop();
@@ -133,11 +136,22 @@ struct MemoryFoldReadsWorker {
 						}
 					}
 					// Pass-through: chase Y output forward.
+					// Aggressive-mode adds $concat / $slice / $buf / $logic_and /
+					// $logic_or / $reduce_bool / $reduce_xnor / $bwmux to the
+					// pass-through list so byte-concat reads (e.g. FDR's
+					// extracted_name[i] <= {sector_buffer[A+1], sector_buffer[A]})
+					// can find their downstream $dffe.EN active signal.  Default
+					// pass-through list unchanged.
 					if (cell->type.in(ID($shiftx), ID($shift), ID($not), ID($pos), ID($neg),
 					                   ID($logic_not), ID($and), ID($or), ID($xor), ID($xnor),
 					                   ID($reduce_or), ID($reduce_and), ID($reduce_xor),
 					                   ID($add), ID($sub), ID($eq), ID($ne), ID($lt), ID($le),
-					                   ID($gt), ID($ge), ID($bmux), ID($demux))) {
+					                   ID($gt), ID($ge), ID($bmux), ID($demux)) ||
+					    (aggressive &&
+					     cell->type.in(ID($buf), ID($slice), ID($concat),
+					                   ID($logic_and), ID($logic_or),
+					                   ID($reduce_bool), ID($reduce_xnor),
+					                   ID($bwmux)))) {
 						if (cell->hasPort(ID::Y)) {
 							for (auto &b : sigmap(cell->getPort(ID::Y))) {
 								if (visited.insert(b).second) q.push(b);
@@ -232,6 +246,8 @@ struct MemoryFoldReadsWorker {
 
 			SigSpec addr_chain = surv.addr;
 			int folded_into_surv = 0;
+			std::vector<bool> port_folded(idxs.size(), false);
+			port_folded[0] = true;
 			for (size_t j = 1; j < idxs.size(); j++) {
 				auto &other = mem.rd_ports[idxs[j]];
 				SigSpec other_addr = other.addr;
@@ -254,6 +270,7 @@ struct MemoryFoldReadsWorker {
 				}
 				addr_chain = module->Mux(NEW_ID, addr_chain, other_addr, sel);
 				folded_into_surv++;
+				port_folded[j] = true;
 			}
 
 			if (folded_into_surv == 0) continue;  // nothing folded for this group
@@ -262,8 +279,21 @@ struct MemoryFoldReadsWorker {
 
 			// Connect each non-survivor's data to the survivor's data so that
 			// consumers see the (now-shared) read result.  Then mark removed.
+			//
+			// AGGRESSIVE-MODE FIX (YOSYS_MEM_FOLD_AGGRESSIVE=1): when a port was
+			// SKIPPED above (no active signal found), do NOT rewire its data and
+			// do NOT mark it removed.  The previous default behaviour silently
+			// connected the skipped port's data to the survivor without folding
+			// its address into addr_chain, producing wrong-data reads.  In
+			// non-aggressive (default) mode the original behaviour is preserved
+			// for backward compatibility.
 			for (size_t j = 1; j < idxs.size(); j++) {
 				auto &other = mem.rd_ports[idxs[j]];
+				if (aggressive && !port_folded[j]) {
+					log("memory_fold_reads: preserving skipped port %zu of %s.%s.\n",
+						idxs[j], log_id(module), log_id(mem.memid));
+					continue;
+				}
 				if (other.removed) continue;
 				int other_dw = GetSize(orig_data[j]);
 				if (other_dw != data_width) {
@@ -303,6 +333,12 @@ struct MemoryFoldReadsPass : public Pass {
 		log("    -min-ports N        only fold memories with >= N read ports (default 2)\n");
 		log("    -only-mem name1,... allowlist\n");
 		log("\n");
+		log("Environment:\n");
+		log("    YOSYS_MEM_FOLD_AGGRESSIVE=1\n");
+		log("        Increase async active-signal search depth from 6 to 32 and preserve\n");
+		log("        skipped async ports (don't rewire their data into the survivor).\n");
+		log("        Off by default; backward-compatible.\n");
+		log("\n");
 	}
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override {
@@ -311,6 +347,12 @@ struct MemoryFoldReadsPass : public Pass {
 		int min_bits = 4096;
 		int min_ports = 2;
 		pool<IdString> only_mem;
+		const char *env_aggressive = getenv("YOSYS_MEM_FOLD_AGGRESSIVE");
+		bool aggressive = env_aggressive && env_aggressive[0] && std::string(env_aggressive) != "0";
+		int active_search_depth = aggressive ? 32 : 6;
+		if (aggressive)
+			log("memory_fold_reads: YOSYS_MEM_FOLD_AGGRESSIVE enabled; active-signal search depth is %d and skipped async ports are preserved.\n",
+				active_search_depth);
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-min-bits" && argidx + 1 < args.size()) {
@@ -345,7 +387,7 @@ struct MemoryFoldReadsPass : public Pass {
 
 		int total_mems = 0, total_eliminated = 0;
 		for (auto mod : design->selected_modules()) {
-			MemoryFoldReadsWorker w(mod, min_bits, min_ports, only_mem);
+			MemoryFoldReadsWorker w(mod, min_bits, min_ports, only_mem, aggressive, active_search_depth);
 			w.run();
 			total_mems += w.memories_folded;
 			total_eliminated += w.ports_eliminated;
