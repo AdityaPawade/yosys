@@ -57,15 +57,27 @@ ram block $__GOWIN_DP_ {
 
 ram block $__GOWIN_SDP_ {
 	abits 14;
-	widths 9 18 36 per_port;
-	# 2026-05-10 Phase 10 — Gowin EDA proof point: GowinSynthesis maps the
-	# multi-port FDR sector_buffer to SDPB (Semi-Dual-Port) primitives, NOT
-	# DPB/DPX9B. SDP has clean port semantics (1R + 1W), no ambiguous
-	# bidirectional roles across replicas. We bias libmap toward SDP first
-	# by halving the cost vs DP/SP. True dual-port memories (which SDP
-	# cannot represent) still fall through to $__GOWIN_DP_.
+	widths 1 2 4 8 16 32 per_port;
+	# 2026-05-12 Phase 11 — Gowin EDA bit-stripe proof point: decrypted Gowin
+	# .vg netlist shows GowinSynthesis maps multi-port sector_buffer to SDPB
+	# (8-bit family widths 1/2/4/8/16/32), NOT SDPX9B (9-bit family 1/2/4/9/18/36).
+	# Specifically uses 1-bit-write x 32-bit-read SDPB cells in a bit-stripe
+	# pattern (8 cells share one logical storage, each handling 1 bit of write
+	# data, all serving 32-bit parallel reads at different addresses).
+	#
+	# Previous patch (2026-05-10, commit 49338eb5) lowered SDP cost to 64 to
+	# bias libmap away from DP, but kept widths 9/18/36 -> libmap kept requesting
+	# 9-bit widths -> brams_map_gw5a.v fell through to SDPX9B branch.
+	# This change forces 8-bit family widths so brams_map_gw5a.v takes the
+	# PORT_W_WIDTH < 9 branch and emits SDPB. The SDPB code path was already
+	# present (and unreachable) in brams_map_gw5a.v line 348-378 — we just
+	# need libmap to request widths < 9 to activate it.
+	#
+	# byte=8 means write-byte-enable granularity is 8 bits per byte (not 9).
+	# True dual-port and 9-bit-family-only memories (rare) fall through to
+	# $__GOWIN_DP_ (still has 9/18 in its widths list).
 	cost 64;
-	byte 9;
+	byte 8;
 	init no_undef;
 	port sr "R" {
 		clock posedge;
