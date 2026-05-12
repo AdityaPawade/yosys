@@ -343,10 +343,61 @@ wire RST = OPTION_RESET_MODE == "SYNC" ? PORT_R_RD_SRST : PORT_R_RD_ARST;
 wire [13:0] ADW = `addrbe(PORT_W_WIDTH, PORT_W_ADDR, PORT_W_WR_BE);
 wire WRE = PORT_W_CLK_EN & PORT_W_WR_EN;
 
+// 2026-05-12 (Codex thread 019e1b34): family selector for SDP techmap.
+// libmap may request widths from the 8-bit family (1/2/4/8/16/32 — emitted
+// as SDPB native), the 9-bit family (9/18/36 — emitted as SDPX9B native),
+// or the small shared subset (1/2/4 — historically goes through x8
+// transcoding macros).
+// The previous condition `< 9 ? SDPB : SDPX9B` correctly handled the case
+// where brams.txt advertised `widths 9 18 36 per_port` only. After the
+// Phase-11 patch advertised `widths 1 2 4 8 16 32 per_port` (8-bit family),
+// libmap started requesting widths 8/16/32 which fell into the `>= 9` else
+// branch and emitted SDPX9B cells with illegal BIT_WIDTH=32 — nextpnr
+// rejected the resulting cells. New condition distinguishes the three
+// families explicitly.
+`define x8_native_width(w) (w == 8 || w == 16 || w == 32)
+`define x9_family_width(w) (w == 9 || w == 18 || w == 36)
+
 generate
 
-if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
+if (`x8_native_width(PORT_W_WIDTH) && `x8_native_width(PORT_R_WIDTH)) begin
+	// Native SDPB at widths 8/16/32 — direct passthrough, no x8 transcoding.
+	// Used by memory_widen_mixed output (32x128 widened from 8x512).
+	wire [31:0] DI;
+	wire [31:0] DO;
+	if (PORT_W_WIDTH == 32) assign DI = PORT_W_WR_DATA;
+	else if (PORT_W_WIDTH == 16) assign DI = {16'b0, PORT_W_WR_DATA};
+	else /* 8 */ assign DI = {24'b0, PORT_W_WR_DATA};
+	assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
 
+	SDPB #(
+		`INIT(init_slice_x8)
+		.READ_MODE(1'b0),
+		.BIT_WIDTH_0(PORT_W_WIDTH),
+		.BIT_WIDTH_1(PORT_R_WIDTH),
+		.BLK_SEL_0(3'b000),
+		.BLK_SEL_1(3'b000),
+		.RESET_MODE(OPTION_RESET_MODE),
+	) _TECHMAP_REPLACE_ (
+		.BLKSELA(3'b000),
+		.BLKSELB(3'b000),
+
+		.CLKA(PORT_W_CLK),
+		.CEA(WRE),
+		.ADA(ADW),
+		.DI(DI),
+
+		.CLKB(PORT_R_CLK),
+		// Phase-12 patch: CEB=1'b1 defeats opt_dff per-replica CEB folding.
+		.CEB(1'b1),
+		.RESET(RST),
+		.OCE(1'b1),
+		.ADB(PORT_R_ADDR),
+		.DO(DO),
+	);
+
+end else if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
+	// Narrow widths {1, 2, 4} — historical SDPB path with x8 transcoding.
 	wire [31:0] DI = `x8_wr_data(PORT_W_WR_DATA);
 	wire [31:0] DO;
 
@@ -370,13 +421,6 @@ if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 		.DI(DI),
 
 		.CLKB(PORT_R_CLK),
-		// 2026-05-12 Phase 12 — Tie CEB high to prevent yosys opt_dff from
-		// folding per-replica read-enable LUTs into BSRAM CEB. JSON audit of
-		// 16 SDPB sector_buffer replicas (Day-6) showed CEB was driven by 4
-		// different nets (1141, 6314, 10204, 12037=VCC); replicas with
-		// non-VCC CEB had their read outputs stuck under certain FSM states
-		// because opt_dff's LUT4 gating didn't fire at the right cycle.
-		// Forcing CEB=1'b1 makes all SDPB replicas always-readable.
 		.CEB(1'b1),
 		.RESET(RST),
 		.OCE(1'b1),
@@ -385,7 +429,7 @@ if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 	);
 
 end else begin
-
+	// 9-bit family widths {9, 18, 36} — SDPX9B native.
 	wire [35:0] DI = PORT_W_WR_DATA;
 	wire [35:0] DO;
 
