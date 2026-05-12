@@ -280,16 +280,18 @@ struct MemoryFoldReadsWorker {
 			// Connect each non-survivor's data to the survivor's data so that
 			// consumers see the (now-shared) read result.  Then mark removed.
 			//
-			// AGGRESSIVE-MODE FIX (YOSYS_MEM_FOLD_AGGRESSIVE=1): when a port was
-			// SKIPPED above (no active signal found), do NOT rewire its data and
-			// do NOT mark it removed.  The previous default behaviour silently
-			// connected the skipped port's data to the survivor without folding
-			// its address into addr_chain, producing wrong-data reads.  In
-			// non-aggressive (default) mode the original behaviour is preserved
-			// for backward compatibility.
+			// 2026-05-12 (Codex thread 019e1b34): make skipped-port preservation
+			// UNCONDITIONAL, not gated by YOSYS_MEM_FOLD_AGGRESSIVE.  When a port
+			// was skipped above ("cannot find active signal"), the previous
+			// non-aggressive default silently connected the skipped port's data
+			// to the survivor without folding its address into addr_chain, which
+			// produces wrong-data reads on some replicas — exactly the
+			// symptom seen in the FDR sector_buffer bit-stripe attempts.
+			// Correctness beats backward compatibility: always preserve the
+			// skipped port instead of fusing it with the survivor.
 			for (size_t j = 1; j < idxs.size(); j++) {
 				auto &other = mem.rd_ports[idxs[j]];
-				if (aggressive && !port_folded[j]) {
+				if (!port_folded[j]) {
 					log("memory_fold_reads: preserving skipped port %zu of %s.%s.\n",
 						idxs[j], log_id(module), log_id(mem.memid));
 					continue;

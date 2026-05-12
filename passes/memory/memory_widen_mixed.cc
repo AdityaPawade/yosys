@@ -53,11 +53,36 @@ struct MemoryWidenMixedWorker {
 	MemoryWidenMixedWorker(Module *m, int mb, int tl, pool<IdString> om)
 		: module(m), min_bits(mb), target_log2(tl), only_mem(om) {}
 
+	// 2026-05-12 (Codex thread 019e1b34): allow hierarchical-suffix match.
+	// `-only-mem fdr_reader_inst.sector_buffer` now matches a memid like
+	// `\top_p15b.u_risc.sd_drv_inst.fdr_reader_inst.sector_buffer` because the
+	// pattern is preceded by `.` in the haystack. Exact match still works.
+	// The `.` separator requirement prevents `foo_sector_buffer` from
+	// accidentally matching pattern `sector_buffer`.
+	bool memid_matches_only_mem(IdString memid)
+	{
+		std::string hay = memid.str();
+		for (auto pat_id : only_mem) {
+			std::string pat = pat_id.str();
+			if (hay == pat)
+				return true;
+			if (!pat.empty() && pat[0] == '\\')
+				pat = pat.substr(1);
+			if (pat.empty())
+				continue;
+			if (hay.size() > pat.size() &&
+			    hay.compare(hay.size() - pat.size(), pat.size(), pat) == 0 &&
+			    hay[hay.size() - pat.size() - 1] == '.')
+				return true;
+		}
+		return false;
+	}
+
 	void run() {
 		auto mems = Mem::get_selected_memories(module);
 		for (auto &mem : mems) {
 			if (!only_mem.empty()) {
-				if (!only_mem.count(mem.memid)) continue;
+				if (!memid_matches_only_mem(mem.memid)) continue;
 			} else {
 				int total_bits = mem.width * mem.size;
 				if (total_bits < min_bits) continue;
@@ -247,7 +272,7 @@ struct MemoryWidenMixedPass : public Pass {
 		log("\n");
 		log("    -min-bits N          only widen memories with width*depth >= N (default 1024)\n");
 		log("    -target-log2 K       widening factor (default 2 = 4x).  Result width = base << K.\n");
-		log("    -only-mem name1,...  comma-separated allowlist of memory names\n");
+		log("    -only-mem name1,...  comma-separated allowlist; names match exact or hierarchical suffix (preceded by '.')\n");
 		log("\n");
 	}
 
