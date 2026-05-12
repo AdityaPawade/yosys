@@ -361,40 +361,95 @@ wire WRE = PORT_W_CLK_EN & PORT_W_WR_EN;
 generate
 
 if (`x8_native_width(PORT_W_WIDTH) && `x8_native_width(PORT_R_WIDTH)) begin
-	// Native SDPB at widths 8/16/32 — direct passthrough, no x8 transcoding.
-	// Used by memory_widen_mixed output (32x128 widened from 8x512).
-	wire [31:0] DI;
-	wire [31:0] DO;
-	if (PORT_W_WIDTH == 32) assign DI = PORT_W_WR_DATA;
-	else if (PORT_W_WIDTH == 16) assign DI = {16'b0, PORT_W_WR_DATA};
-	else /* 8 */ assign DI = {24'b0, PORT_W_WR_DATA};
-	assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
+	// Native SDPB at widths 8/16/32.
+	//
+	// 2026-05-12 (Codex thread 019e1b34 Phase 14): when memory_widen_mixed
+	// produces a 32-bit write port WITH BYTE ENABLES (PORT_W_WR_BE_WIDTH > 1),
+	// we must configure SDPB ASYMMETRICALLY (BIT_WIDTH_0=8 byte write,
+	// BIT_WIDTH_1=PORT_R_WIDTH word read).  SDPB has no native byte-enable
+	// on a symmetric 32x32 configuration — a 32-bit write overwrites all 4
+	// bytes, zeroing the 3 bytes outside the lane we intended to write.
+	// That's the "51 00 00 49 42 FF FF" garbage we saw on OLED in Day-8.
+	//
+	// Asymmetric SDPB: the cell stores depth*8 bits with byte-wise writes
+	// to an 11-bit address (byte_addr = word_addr * (R_W/8) + byte_idx) and
+	// 32-bit (or wider) reads at a 9-bit address (word_addr).
+	//
+	// byte_idx priority-encoded from PORT_W_WR_BE (assumed one-hot per cycle —
+	// memory_widen_mixed produces one-hot byte enables for original 8-bit
+	// writers, which is our case).
+	//
+	// OCE tied GND to match Gowin reference (READ_MODE=0 bypass).
+	// RESET tied GND to match Gowin reference (read output is combinational
+	// off the BSRAM array, no register to reset).
+	if (PORT_W_WIDTH == 32 && PORT_W_WR_BE_WIDTH == 4) begin
+		// memory_widen_mixed output: 32-bit byte-enabled write, 32-bit read.
+		wire [1:0] byte_idx = PORT_W_WR_BE[3] ? 2'd3 :
+		                      PORT_W_WR_BE[2] ? 2'd2 :
+		                      PORT_W_WR_BE[1] ? 2'd1 : 2'd0;
+		wire WRE_any = PORT_W_CLK_EN & PORT_W_WR_EN & (|PORT_W_WR_BE);
+		wire [13:0] ADA_byte = {PORT_W_ADDR[11:0], byte_idx};
+		wire [7:0]  DI_byte = byte_idx == 2'd3 ? PORT_W_WR_DATA[31:24] :
+		                      byte_idx == 2'd2 ? PORT_W_WR_DATA[23:16] :
+		                      byte_idx == 2'd1 ? PORT_W_WR_DATA[15:8]  :
+		                                         PORT_W_WR_DATA[7:0];
+		wire [31:0] DO_word;
+		assign PORT_R_RD_DATA = DO_word[PORT_R_WIDTH-1:0];
 
-	SDPB #(
-		`INIT(init_slice_x8)
-		.READ_MODE(1'b0),
-		.BIT_WIDTH_0(PORT_W_WIDTH),
-		.BIT_WIDTH_1(PORT_R_WIDTH),
-		.BLK_SEL_0(3'b000),
-		.BLK_SEL_1(3'b000),
-		.RESET_MODE(OPTION_RESET_MODE),
-	) _TECHMAP_REPLACE_ (
-		.BLKSELA(3'b000),
-		.BLKSELB(3'b000),
+		SDPB #(
+			`INIT(init_slice_x8)
+			.READ_MODE(1'b0),
+			.BIT_WIDTH_0(8),
+			.BIT_WIDTH_1(PORT_R_WIDTH),
+			.BLK_SEL_0(3'b000),
+			.BLK_SEL_1(3'b000),
+			.RESET_MODE(OPTION_RESET_MODE),
+		) _TECHMAP_REPLACE_ (
+			.BLKSELA(3'b000),
+			.BLKSELB(3'b000),
+			.CLKA(PORT_W_CLK),
+			.CEA(WRE_any),
+			.ADA(ADA_byte),
+			.DI({24'b0, DI_byte}),
+			.CLKB(PORT_R_CLK),
+			.CEB(1'b1),         // Phase-12: defeat opt_dff CEB folding
+			.RESET(1'b0),       // Phase-14: match Gowin RESET=GND (no read reset needed at READ_MODE=0)
+			.OCE(1'b0),         // Phase-14: match Gowin OCE=GND
+			.ADB(PORT_R_ADDR),
+			.DO(DO_word),
+		);
+	end else begin
+		// Symmetric SDPB at native widths 8/16/32 (no byte enables).
+		wire [31:0] DI;
+		wire [31:0] DO;
+		if (PORT_W_WIDTH == 32) assign DI = PORT_W_WR_DATA;
+		else if (PORT_W_WIDTH == 16) assign DI = {16'b0, PORT_W_WR_DATA};
+		else /* 8 */ assign DI = {24'b0, PORT_W_WR_DATA};
+		assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
 
-		.CLKA(PORT_W_CLK),
-		.CEA(WRE),
-		.ADA(ADW),
-		.DI(DI),
-
-		.CLKB(PORT_R_CLK),
-		// Phase-12 patch: CEB=1'b1 defeats opt_dff per-replica CEB folding.
-		.CEB(1'b1),
-		.RESET(RST),
-		.OCE(1'b1),
-		.ADB(PORT_R_ADDR),
-		.DO(DO),
-	);
+		SDPB #(
+			`INIT(init_slice_x8)
+			.READ_MODE(1'b0),
+			.BIT_WIDTH_0(PORT_W_WIDTH),
+			.BIT_WIDTH_1(PORT_R_WIDTH),
+			.BLK_SEL_0(3'b000),
+			.BLK_SEL_1(3'b000),
+			.RESET_MODE(OPTION_RESET_MODE),
+		) _TECHMAP_REPLACE_ (
+			.BLKSELA(3'b000),
+			.BLKSELB(3'b000),
+			.CLKA(PORT_W_CLK),
+			.CEA(WRE),
+			.ADA(ADW),
+			.DI(DI),
+			.CLKB(PORT_R_CLK),
+			.CEB(1'b1),
+			.RESET(1'b0),       // Phase-14: match Gowin RESET=GND
+			.OCE(1'b0),         // Phase-14: match Gowin OCE=GND
+			.ADB(PORT_R_ADDR),
+			.DO(DO),
+		);
+	end
 
 end else if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 	// Narrow widths {1, 2, 4} — historical SDPB path with x8 transcoding.
