@@ -384,11 +384,23 @@ if (`x8_native_width(PORT_W_WIDTH) && `x8_native_width(PORT_R_WIDTH)) begin
 	// off the BSRAM array, no register to reset).
 	if (PORT_W_WIDTH == 32 && PORT_W_WR_BE_WIDTH == 4) begin
 		// memory_widen_mixed output: 32-bit byte-enabled write, 32-bit read.
+		//
+		// 2026-05-12 (Phase 15): correct ADA packing.  yosys libmap places the
+		// word address LEFT-ALIGNED in PORT_W_ADDR (word_addr at PORT_W_ADDR[11:5]
+		// to keep the bottom 5 bits available for byte-position-within-word).
+		// SDPB at BIT_WIDTH_0=8 uses ADA[13:3] as the byte address (lower 3 bits
+		// are within-byte and ignored).  So byte_addr (= word_addr*4 + byte_idx)
+		// must land at ADA[13:3]: word_addr at ADA[11:5] (already there from
+		// PORT_W_ADDR), byte_idx at ADA[4:3].  We OR byte_idx<<3 into PORT_W_ADDR.
+		// Phase-14 packed `{PORT_W_ADDR[11:0], byte_idx[1:0]}` which put byte_idx
+		// at ADA[1:0] — OUTSIDE the BIT_WIDTH=8 address window — making all 4
+		// bytes of a word collide to the same cell address.  That's the Day-9
+		// hardware-garbage cause.
 		wire [1:0] byte_idx = PORT_W_WR_BE[3] ? 2'd3 :
 		                      PORT_W_WR_BE[2] ? 2'd2 :
 		                      PORT_W_WR_BE[1] ? 2'd1 : 2'd0;
 		wire WRE_any = PORT_W_CLK_EN & PORT_W_WR_EN & (|PORT_W_WR_BE);
-		wire [13:0] ADA_byte = {PORT_W_ADDR[11:0], byte_idx};
+		wire [13:0] ADA_byte = PORT_W_ADDR | {9'b0, byte_idx, 3'b000};
 		wire [7:0]  DI_byte = byte_idx == 2'd3 ? PORT_W_WR_DATA[31:24] :
 		                      byte_idx == 2'd2 ? PORT_W_WR_DATA[23:16] :
 		                      byte_idx == 2'd1 ? PORT_W_WR_DATA[15:8]  :
