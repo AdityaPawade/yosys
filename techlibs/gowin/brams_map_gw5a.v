@@ -370,7 +370,14 @@ if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 		.DI(DI),
 
 		.CLKB(PORT_R_CLK),
-		.CEB(PORT_R_CLK_EN),
+		// 2026-05-12 Phase 12 — Tie CEB high to prevent yosys opt_dff from
+		// folding per-replica read-enable LUTs into BSRAM CEB. JSON audit of
+		// 16 SDPB sector_buffer replicas (Day-6) showed CEB was driven by 4
+		// different nets (1141, 6314, 10204, 12037=VCC); replicas with
+		// non-VCC CEB had their read outputs stuck under certain FSM states
+		// because opt_dff's LUT4 gating didn't fire at the right cycle.
+		// Forcing CEB=1'b1 makes all SDPB replicas always-readable.
+		.CEB(1'b1),
 		.RESET(RST),
 		.OCE(1'b1),
 		.ADB(PORT_R_ADDR),
