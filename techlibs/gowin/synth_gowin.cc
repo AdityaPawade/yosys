@@ -317,16 +317,13 @@ struct SynthGowinPass : public ScriptPass
 			// memory_libmap.  -nosat avoids SAT-based write-port sharing OOM that
 			// can hit on designs with many small memrd_v2 cells.
 			if (family == "gw5a") {
-				// Do not fold/share FDR sector_buffer read ports on GW5A.
-				// Production sdtest has multiple same-cycle logical reads from this
-				// memory; memory_fold_reads assumes mutual exclusion and produces
-				// undefined behavior when that assumption is false. Keep the 8->32
-				// widening, but let memory_libmap allocate independent SDPB read
-				// replicas instead of muxing consumers onto shared read ports.
-				// Fix per Codex thread 019e21be (2026-05-13): root-cause for
-				// production sdtest reading sector_buffer[0]=0x00 while LA-verified
-				// SD card delivers 0x03 (17-cell BW=8,32 heisenbug).
-				run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2");
+				// R3 fallback step C (Codex thread 019e21d3): drop memory_widen_mixed
+				// for FDR sector_buffer. Stays in BIT_WIDTH_0=8 BIT_WIDTH_1=8 SDPB
+				// territory (the topology probe_multi_v5 proved works on OSS) instead
+				// of asymmetric (8,32) which exhibited the 17-cell heisenbug.
+				// Also dropping memory_fold_reads (unsafe for concurrent reads).
+				run("memory_share -nosat");
+				run("memory_share -nosat");
 				run("memory_async2sync -min-bits 1024 -max-ports 20");
 				run("memory_collect");
 			}
@@ -341,14 +338,15 @@ struct SynthGowinPass : public ScriptPass
 			}
 			if (family == "gw5a") {
 				// gw5a has no SSRAM; map only to BSRAM, don't include lutrams.txt.
-				// Bias toward BRAM with -logic-cost-ram 4: makes FF mapping 8x more
-				// expensive per bit, so any memory >= ~16 bits prefers BRAM if a
-				// matching cell exists.  Saves DFFs for designs with many small
-				// memories.  Demote small (cpuregs etc.) to FF mapping first to free
-				// BSRAM cells so the placer has slack on tight designs.
+				// Bias HARD toward BRAM with -logic-cost-ram 32 (was 4): after
+				// memory_fold_reads removal, FDR sector_buffer presents more
+				// independent read ports to libmap and per-replica BSRAM cost was
+				// crossing over FF cost. Per Codex thread 019e21d3 (2026-05-13,
+				// 65% confidence), bump cost factor by 8x. Small memories still
+				// pre-demoted to FF before libmap to preserve BSRAM slack.
 				run("memory_demote_small -max-bits 2048", "(demote small memories <N bits to FF mapping, BEFORE libmap)");
 				run("memory_demote_small -only-mem mbr_reader_inst.sector_buffer", "(also demote mbr to free BSRAM cells for placement slack)");
-				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a -logic-cost-ram 4%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
+				run(stringf("memory_libmap -lib +/gowin/brams.txt -D gw5a -logic-cost-ram 128%s", args.c_str()), "(-no-auto-block if -nobram; -no-auto-distributed forced for gw5a)");
 				run("techmap -map +/gowin/brams_map_gw5a.v");
 			} else {
 				run(stringf("memory_libmap -lib +/gowin/lutrams.txt -lib +/gowin/brams.txt%s", args.c_str()), "(-no-auto-block if -nobram, -no-auto-distributed if -nolutram)");
