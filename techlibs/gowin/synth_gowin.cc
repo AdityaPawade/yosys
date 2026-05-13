@@ -317,11 +317,17 @@ struct SynthGowinPass : public ScriptPass
 			// memory_libmap.  -nosat avoids SAT-based write-port sharing OOM that
 			// can hit on designs with many small memrd_v2 cells.
 			if (family == "gw5a") {
-				// Extra port consolidation rounds (memory_share now OR'es enables).
-				// Multiple passes catch transitive merges as new ports get widened.
-				run("memory_share -nosat");
-				run("memory_share -nosat");
-				run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2"); run("memory_share -nosat"); run("memory_share -nosat"); run("memory_fold_reads -min-bits 4096"); run("memory_async2sync -min-bits 1024 -max-ports 20");
+				// Do not fold/share FDR sector_buffer read ports on GW5A.
+				// Production sdtest has multiple same-cycle logical reads from this
+				// memory; memory_fold_reads assumes mutual exclusion and produces
+				// undefined behavior when that assumption is false. Keep the 8->32
+				// widening, but let memory_libmap allocate independent SDPB read
+				// replicas instead of muxing consumers onto shared read ports.
+				// Fix per Codex thread 019e21be (2026-05-13): root-cause for
+				// production sdtest reading sector_buffer[0]=0x00 while LA-verified
+				// SD card delivers 0x03 (17-cell BW=8,32 heisenbug).
+				run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2");
+				run("memory_async2sync -min-bits 1024 -max-ports 20");
 				run("memory_collect");
 			}
 			std::string args = "";
