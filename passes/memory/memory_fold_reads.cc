@@ -32,8 +32,14 @@ struct MemoryFoldReadsWorker {
 	int min_bits;
 	int min_ports;
 	pool<IdString> only_mem;
+	pool<IdString> exclude_mem;
 	bool aggressive;
 	int active_search_depth;
+	// 2026-05-15: when true, use the conservative consensus-based
+	// active-signal selector (per Codex thread 019e2801). When false,
+	// use the original first-match-on-data[0] heuristic. Gated by the
+	// -consensus pass argument and/or YOSYS_MEM_FOLD_CONSENSUS env var.
+	bool consensus_mode;
 
 	// SigMap to canonicalise signals before lookup.
 	SigMap sigmap;
@@ -43,9 +49,9 @@ struct MemoryFoldReadsWorker {
 	int memories_folded = 0;
 	int ports_eliminated = 0;
 
-	MemoryFoldReadsWorker(Module *m, int mb, int mp, pool<IdString> om, bool aggr, int depth)
-		: module(m), min_bits(mb), min_ports(mp), only_mem(om),
-		  aggressive(aggr), active_search_depth(depth), sigmap(m) {
+	MemoryFoldReadsWorker(Module *m, int mb, int mp, pool<IdString> om, pool<IdString> em, bool aggr, int depth, bool cons)
+		: module(m), min_bits(mb), min_ports(mp), only_mem(om), exclude_mem(em),
+		  aggressive(aggr), active_search_depth(depth), consensus_mode(cons), sigmap(m) {
 		build_consumer_index();
 	}
 
@@ -63,7 +69,12 @@ struct MemoryFoldReadsWorker {
 	// port.data into the consuming logic and finding a $mux whose A or B
 	// input is port.data and whose S input is a single-bit signal that
 	// (heuristically) decides whether this port's read result is observed.
-	SigSpec extract_active_signal(SigSpec data) {
+	// 2026-05-15: renamed from extract_active_signal to make room for the
+	// new consensus-based selector. Existing call sites go through the
+	// extract_active_signal() dispatcher (defined below) which routes to
+	// either this first-match impl or the consensus impl based on
+	// consensus_mode.
+	SigSpec extract_active_signal_firstmatch(SigSpec data) {
 		if (data.empty()) return SigSpec();
 		// BFS through consumer cells starting at data[0], looking for either
 		//   - a $mux/$pmux gated by a single-bit S (use S as active signal); or
@@ -165,9 +176,212 @@ struct MemoryFoldReadsWorker {
 		return SigSpec();
 	}
 
+	// ============================================================
+	// 2026-05-15 (Codex thread 019e2801): conservative consensus-based
+	// active-signal selection. Refuses to fold a read port unless every
+	// data bit yields the SAME unique minimum-depth candidate active
+	// signal. Ambiguity within a bit, or disagreement across bits,
+	// causes the port to be left unfolded (same effect as if no
+	// candidate were found).
+	//
+	// Motivation: PROD's FSM mux cone for the byte-0 read of
+	// fdr_reader_inst.sector_buffer contained multiple plausible
+	// candidate guards; the original first-match-on-data[0] heuristic
+	// picked one that mis-aligned the address mux vs SPI write timing,
+	// yielding stale 0x00 instead of fresh 0x03. Requiring consensus
+	// makes fold refuse the bad candidate, which preserves the port
+	// instead of folding it incorrectly.
+	struct ActiveCand {
+		enum Kind { MUX_POS, MUX_NEG, DFFE_EN, PMUX_BK, PMUX_DEFAULT };
+		Kind kind;
+		SigSpec sig;   // 1-bit raw for MUX/DFFE/PMUX_BK; full S for PMUX_DEFAULT.
+		bool operator==(const ActiveCand &o) const {
+			return kind == o.kind && sig == o.sig;
+		}
+	};
+
+	// Per-bit BFS that COLLECTS all distinct candidates at the minimum
+	// depth where any candidate is found (does not return early on first
+	// match). Returns true iff at least one candidate was found.
+	bool collect_candidates_for_bit(SigBit start, std::vector<ActiveCand> &out_best) {
+		out_best.clear();
+		if (!bit_to_consumers.count(start)) return false;
+		pool<SigBit> visited;
+		std::queue<SigBit> q;
+		q.push(start);
+		visited.insert(start);
+		int depth = 0;
+		int best_depth = -1;
+		while (!q.empty() && depth < active_search_depth) {
+			if (best_depth >= 0 && depth > best_depth) break;
+			int sz = (int)q.size();
+			for (int i = 0; i < sz; i++) {
+				SigBit cur = q.front(); q.pop();
+				if (!bit_to_consumers.count(cur)) continue;
+				for (auto cell : bit_to_consumers.at(cur)) {
+					auto record = [&](const ActiveCand &c) {
+						if (best_depth < 0 || depth < best_depth) {
+							out_best.clear();
+							best_depth = depth;
+						}
+						if (depth == best_depth) {
+							for (auto &e : out_best) if (e == c) return;
+							out_best.push_back(c);
+						}
+					};
+					// $mux: data on A or B -> S is the active signal.
+					if (cell->type == ID($mux)) {
+						SigSpec s = cell->getPort(ID::S);
+						if (GetSize(s) != 1) continue;
+						SigSpec a = cell->getPort(ID::A);
+						SigSpec by = cell->getPort(ID::B);
+						bool in_a = false, in_b = false;
+						for (auto &x : sigmap(a)) if (x == cur) { in_a = true; break; }
+						for (auto &x : sigmap(by)) if (x == cur) { in_b = true; break; }
+						if (!in_a && !in_b) continue;
+						record({ in_b ? ActiveCand::MUX_POS : ActiveCand::MUX_NEG,
+						         SigSpec(s) });
+						continue;
+					}
+					// $pmux: Y = case S of B[0..W-1]; else A.
+					if (cell->type == ID($pmux)) {
+						SigSpec s = cell->getPort(ID::S);
+						SigSpec a = cell->getPort(ID::A);
+						SigSpec by = cell->getPort(ID::B);
+						int W = GetSize(a);
+						int N = GetSize(s);
+						if (N < 1 || GetSize(by) != W * N) continue;
+						int found_k = -1;
+						SigSpec by_mapped = sigmap(by);
+						for (int k = 0; k < N; k++) {
+							for (int b = 0; b < W; b++)
+								if (by_mapped[k * W + b] == cur) { found_k = k; break; }
+							if (found_k >= 0) break;
+						}
+						if (found_k >= 0) {
+							record({ ActiveCand::PMUX_BK, SigSpec(s[found_k]) });
+							continue;
+						}
+						SigSpec a_mapped = sigmap(a);
+						bool in_a = false;
+						for (auto &x : a_mapped) if (x == cur) { in_a = true; break; }
+						if (in_a) record({ ActiveCand::PMUX_DEFAULT, s });
+						continue;
+					}
+					// $dff* with EN.
+					if (cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe),
+					                  ID($sdff), ID($sdffe))) {
+						if (cell->hasPort(ID::EN)) {
+							SigSpec en = cell->getPort(ID::EN);
+							if (GetSize(en) == 1)
+								record({ ActiveCand::DFFE_EN, SigSpec(en) });
+						}
+						continue;
+					}
+					// Pass-through (same list as firstmatch impl).
+					if (cell->type.in(ID($shiftx), ID($shift), ID($not), ID($pos), ID($neg),
+					                   ID($logic_not), ID($and), ID($or), ID($xor), ID($xnor),
+					                   ID($reduce_or), ID($reduce_and), ID($reduce_xor),
+					                   ID($add), ID($sub), ID($eq), ID($ne), ID($lt), ID($le),
+					                   ID($gt), ID($ge), ID($bmux), ID($demux)) ||
+					    (aggressive &&
+					     cell->type.in(ID($buf), ID($slice), ID($concat),
+					                   ID($logic_and), ID($logic_or),
+					                   ID($reduce_bool), ID($reduce_xnor),
+					                   ID($bwmux)))) {
+						if (cell->hasPort(ID::Y))
+							for (auto &bb : sigmap(cell->getPort(ID::Y)))
+								if (visited.insert(bb).second) q.push(bb);
+					}
+				}
+			}
+			depth++;
+		}
+		return !out_best.empty();
+	}
+
+	SigSpec extract_active_signal_consensus(SigSpec data) {
+		if (data.empty()) return SigSpec();
+		ActiveCand consensus;
+		bool have_consensus = false;
+		for (int b = 0; b < GetSize(data); b++) {
+			SigBit start = sigmap(data[b]);
+			std::vector<ActiveCand> cands;
+			if (!collect_candidates_for_bit(start, cands)) {
+				log_debug("memory_fold_reads: no candidate for bit %d of %s -- refusing fold\n",
+					b, log_signal(data));
+				return SigSpec();
+			}
+			if (cands.size() > 1) {
+				log_debug("memory_fold_reads: %d ambiguous candidates for bit %d of %s -- refusing fold\n",
+					(int)cands.size(), b, log_signal(data));
+				return SigSpec();
+			}
+			if (!have_consensus) {
+				consensus = cands[0];
+				have_consensus = true;
+			} else if (!(consensus == cands[0])) {
+				log_debug("memory_fold_reads: non-uniform active signal across bits of %s -- refusing fold\n",
+					log_signal(data));
+				return SigSpec();
+			}
+		}
+		if (!have_consensus) return SigSpec();
+		switch (consensus.kind) {
+			case ActiveCand::MUX_POS:      return consensus.sig;
+			case ActiveCand::MUX_NEG:      return module->Not(NEW_ID, consensus.sig);
+			case ActiveCand::DFFE_EN:      return consensus.sig;
+			case ActiveCand::PMUX_BK:      return consensus.sig;
+			case ActiveCand::PMUX_DEFAULT: {
+				SigSpec or_s = module->ReduceOr(NEW_ID, consensus.sig);
+				return module->Not(NEW_ID, or_s);
+			}
+		}
+		return SigSpec();
+	}
+
+	// Dispatcher used by all existing call sites. Routes to either the
+	// firstmatch (default, pre-2026-05-15 behavior) or the new conservative
+	// consensus impl. Selection is set at worker construction time from the
+	// `-consensus` pass argument and/or YOSYS_MEM_FOLD_CONSENSUS env var.
+	SigSpec extract_active_signal(SigSpec data) {
+		if (consensus_mode)
+			return extract_active_signal_consensus(data);
+		return extract_active_signal_firstmatch(data);
+	}
+
+	// 2026-05-15: hierarchical-suffix match for exclude_mem (mirrors
+	// memory_widen_mixed::memid_matches_only_mem). `-exclude-mem
+	// fdr_reader_inst.sector_buffer` matches a memid like
+	// `\top_p15b.u_risc.sd_drv_inst.fdr_reader_inst.sector_buffer` because the
+	// pattern is preceded by `.` in the haystack. Exact match still works.
+	bool memid_matches_exclude_mem(IdString memid)
+	{
+		std::string hay = memid.str();
+		for (auto pat_id : exclude_mem) {
+			std::string pat = pat_id.str();
+			if (hay == pat)
+				return true;
+			if (!pat.empty() && pat[0] == '\\')
+				pat = pat.substr(1);
+			if (pat.empty())
+				continue;
+			if (hay.size() > pat.size() &&
+			    hay.compare(hay.size() - pat.size(), pat.size(), pat) == 0 &&
+			    hay[hay.size() - pat.size() - 1] == '.')
+				return true;
+		}
+		return false;
+	}
+
 	void run() {
 		auto mems = Mem::get_selected_memories(module);
 		for (auto &mem : mems) {
+			if (!exclude_mem.empty() && memid_matches_exclude_mem(mem.memid)) {
+				log("memory_fold_reads: skipping %s.%s (matched -exclude-mem).\n",
+					log_id(module), log_id(mem.memid));
+				continue;
+			}
 			if (!only_mem.empty()) {
 				if (!only_mem.count(mem.memid)) continue;
 			} else {
@@ -333,13 +547,21 @@ struct MemoryFoldReadsPass : public Pass {
 		log("\n");
 		log("    -min-bits N         only fold memories with width*depth >= N (default 4096)\n");
 		log("    -min-ports N        only fold memories with >= N read ports (default 2)\n");
-		log("    -only-mem name1,... allowlist\n");
+		log("    -only-mem name1,... allowlist (exact memid match)\n");
+		log("    -exclude-mem name1,... denylist; names match exact or hierarchical suffix (preceded by '.')\n");
+		log("    -consensus          use the conservative consensus-based active-signal\n");
+		log("                        selector (refuses fold when port's consumer cone\n");
+		log("                        yields ambiguous or non-uniform guards). Off by\n");
+		log("                        default; backward-compatible. May also be enabled\n");
+		log("                        via the YOSYS_MEM_FOLD_CONSENSUS env var.\n");
 		log("\n");
 		log("Environment:\n");
 		log("    YOSYS_MEM_FOLD_AGGRESSIVE=1\n");
 		log("        Increase async active-signal search depth from 6 to 32 and preserve\n");
 		log("        skipped async ports (don't rewire their data into the survivor).\n");
 		log("        Off by default; backward-compatible.\n");
+		log("    YOSYS_MEM_FOLD_CONSENSUS=1\n");
+		log("        Same as -consensus (gates the new conservative selector).\n");
 		log("\n");
 	}
 
@@ -349,12 +571,18 @@ struct MemoryFoldReadsPass : public Pass {
 		int min_bits = 4096;
 		int min_ports = 2;
 		pool<IdString> only_mem;
+		pool<IdString> exclude_mem;
 		const char *env_aggressive = getenv("YOSYS_MEM_FOLD_AGGRESSIVE");
 		bool aggressive = env_aggressive && env_aggressive[0] && std::string(env_aggressive) != "0";
 		int active_search_depth = aggressive ? 32 : 6;
 		if (aggressive)
 			log("memory_fold_reads: YOSYS_MEM_FOLD_AGGRESSIVE enabled; active-signal search depth is %d and skipped async ports are preserved.\n",
 				active_search_depth);
+		// 2026-05-15: consensus mode. Pass arg `-consensus` and/or env var
+		// YOSYS_MEM_FOLD_CONSENSUS=1 enable conservative consensus-based
+		// active-signal selection (see ActiveCand and friends in worker).
+		const char *env_consensus = getenv("YOSYS_MEM_FOLD_CONSENSUS");
+		bool consensus_mode = env_consensus && env_consensus[0] && std::string(env_consensus) != "0";
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-min-bits" && argidx + 1 < args.size()) {
@@ -383,13 +611,40 @@ struct MemoryFoldReadsPass : public Pass {
 				}
 				continue;
 			}
+			if (args[argidx] == "-exclude-mem" && argidx + 1 < args.size()) {
+				std::string list = args[++argidx];
+				size_t pos = 0, prev = 0;
+				while ((pos = list.find(',', prev)) != std::string::npos) {
+					std::string name = list.substr(prev, pos - prev);
+					if (!name.empty()) {
+						if (name[0] != '\\' && name[0] != '$')
+							name = "\\" + name;
+						exclude_mem.insert(name);
+					}
+					prev = pos + 1;
+				}
+				std::string name = list.substr(prev);
+				if (!name.empty()) {
+					if (name[0] != '\\' && name[0] != '$')
+						name = "\\" + name;
+					exclude_mem.insert(name);
+				}
+				continue;
+			}
+			if (args[argidx] == "-consensus") {
+				consensus_mode = true;
+				continue;
+			}
 			break;
 		}
 		extra_args(args, argidx, design);
 
+		if (consensus_mode)
+			log("memory_fold_reads: consensus mode ENABLED (conservative active-signal selector).\n");
+
 		int total_mems = 0, total_eliminated = 0;
 		for (auto mod : design->selected_modules()) {
-			MemoryFoldReadsWorker w(mod, min_bits, min_ports, only_mem, aggressive, active_search_depth);
+			MemoryFoldReadsWorker w(mod, min_bits, min_ports, only_mem, exclude_mem, aggressive, active_search_depth, consensus_mode);
 			w.run();
 			total_mems += w.memories_folded;
 			total_eliminated += w.ports_eliminated;

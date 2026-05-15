@@ -506,6 +506,23 @@ struct OptDffWorker
 				changed = true;
 			}
 		} else if (is_active(ff.sig_ce, ff.pol_ce)) {
+			// R22: skip CE strip on FFs marked with memory_transparency_data
+			// attribute (set by mem.cc emulate_transparency at line ~1169).
+			// Forces PROD to keep DFFRE matching V3_GOOD's structure.
+			// Attribute propagates through FfData::slice → per-bit slices.
+			// 2026-05-15: runtime gate. Set YOSYS_R22_OPTDFF_DISABLE=1 to
+			// bypass and let CE strip run normally (upstream behavior).
+			if (cell->get_bool_attribute(ID(memory_transparency_data))) {
+				static const bool r22_optdff_disabled = []() {
+					const char *v = getenv("YOSYS_R22_OPTDFF_DISABLE");
+					return v && v[0] && std::string(v) != "0";
+				}();
+				if (!r22_optdff_disabled) {
+					log("Skipping always-active EN strip on %s (memory transparency FF, R22 keep-CE).\n",
+						log_id(cell));
+					return;
+				}
+			}
 			log("Removing always-active EN on %s (%s) from module %s.\n",
 					log_id(cell), log_id(cell->type), log_id(module));
 			ff.has_ce = false;
@@ -649,6 +666,25 @@ struct OptDffWorker
 	{
 		std::map<std::pair<patterns_t, ctrls_t>, std::vector<int>> groups;
 		std::vector<int> remaining_indices;
+
+		// R24 (Codex thread 019e25dc): skip CE-merge / feedback-mux merge on
+		// FFs tagged with memory_transparency_data. This prevents the
+		// canonical DFFE -> DFF + self-feedback-mux rewrite from absorbing
+		// our marked transparency FF into a CE-less broadcast register.
+		// 2026-05-15: runtime gate. Shares YOSYS_R22_OPTDFF_DISABLE with the
+		// CE-strip site above (both protect the same memory_transparency_data
+		// attribute).  Set =1 to bypass and let merge run normally.
+		if (cell->get_bool_attribute(ID(memory_transparency_data))) {
+			static const bool r22_optdff_disabled = []() {
+				const char *v = getenv("YOSYS_R22_OPTDFF_DISABLE");
+				return v && v[0] && std::string(v) != "0";
+			}();
+			if (!r22_optdff_disabled) {
+				log("Skipping DFF enable-to-D-mux merge on %s (memory transparency data FF, R24 keep-CE).\n",
+					log_id(cell));
+				return false;
+			}
+		}
 
 		for (int i = 0; i < ff.width; i++) {
 			ctrls_t enables;

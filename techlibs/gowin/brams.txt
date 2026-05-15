@@ -82,9 +82,9 @@ ram block $__GOWIN_SDP_ {
 	port sr "R" {
 		clock posedge;
 		clken;
-		option "RESET_MODE" "SYNC" {
-			rdsrst zero ungated;
-		}
+		# R22: removed SYNC option to force RESET_MODE=ASYNC, matching V3_GOOD.
+		# User wants every SDPB parameter to match working V3 build before
+		# concluding investigation.
 		option "RESET_MODE" "ASYNC" {
 			rdarst zero;
 		}

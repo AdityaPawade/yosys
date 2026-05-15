@@ -584,6 +584,30 @@ void FfData::unmap_ce() {
 	if (!has_ce)
 		return;
 	log_assert(has_clk);
+
+	// R24 (Codex thread 019e25dc): refuse to unmap CE on FFs tagged
+	// memory_transparency_data. Catches all downstream callers
+	// (memory_dff, dfflegalize, async2sync, formalff, etc.) that
+	// would otherwise convert our marked DFFE -> DFF + feedback-mux.
+	// Note: Codex flagged that some callers (memory_dff::handle_rd_port_addr)
+	// assume unmap succeeded. For the marker case, we silently leave the
+	// CE intact -- callers proceed and emit a memory port with port.en
+	// still tied to the FF's CE, which is the CORRECT behavior for
+	// transparency-data FFs (the CE must survive).
+	if (attributes.count(ID(memory_transparency_data))) {
+		// 2026-05-15: runtime gate. Set YOSYS_R24_DISABLE=1 to bypass and
+		// let unmap_ce() run on memory_transparency_data FFs (upstream behavior).
+		static const bool r24_disabled = []() {
+			const char *v = getenv("YOSYS_R24_DISABLE");
+			return v && v[0] && std::string(v) != "0";
+		}();
+		if (!r24_disabled) {
+			log("R24: skipping FfData::unmap_ce() on FF tagged memory_transparency_data (cell=%s).\n",
+				cell ? log_id(cell) : "<sliced>");
+			return;
+		}
+	}
+
 	if (has_srst && ce_over_srst)
 		unmap_srst();
 

@@ -321,7 +321,33 @@ struct SynthGowinPass : public ScriptPass
 				// Multiple passes catch transitive merges as new ports get widened.
 				run("memory_share -nosat");
 				run("memory_share -nosat");
-				run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2"); run("memory_share -nosat"); run("memory_share -nosat"); run("memory_fold_reads -min-bits 4096"); run("memory_async2sync -min-bits 1024 -max-ports 20");
+				// R28 (2026-05-14): REMOVED `memory_widen_mixed -target-log2 2` for sector_buffer.
+				// Widening to 32-bit forces libmap to consolidate to a single SDPB with byte-mux
+				// (PORT_W_WIDTH=32 + PORT_W_WR_BE_WIDTH=4 branch in brams_map_gw5a.v), which
+				// inserts a CE-less broadcast DFF at the SDPB.DI input. V3_N17_GOOD baseline
+				// keeps the write port at 8-bit width, so libmap replicates to N SDPB cells
+				// and each cell's DI is driven DIRECTLY by the SPI shift register's DFFRE.
+				// Bug being fixed: PROD reads sector_buffer[0]=0x00 while SD card delivers 0x03.
+				// 2026-05-15: runtime gates.
+				//   YOSYS_R28_DISABLE=1 -> restore the memory_widen_mixed call (upstream-ish).
+				//   YOSYS_MEM_FOLD_CONSENSUS=1 -> pass -consensus to memory_fold_reads
+				//                                  (conservative active-signal selection,
+				//                                   refuses fold on ambiguous/non-uniform cones).
+				{
+					auto env_on = [](const char *name) {
+						const char *v = getenv(name);
+						return v && v[0] && std::string(v) != "0";
+					};
+					if (env_on("YOSYS_R28_DISABLE"))
+						run("memory_widen_mixed -only-mem fdr_reader_inst.sector_buffer -target-log2 2");
+					run("memory_share -nosat");
+					run("memory_share -nosat");
+					if (env_on("YOSYS_MEM_FOLD_CONSENSUS"))
+						run("memory_fold_reads -min-bits 4096 -consensus");
+					else
+						run("memory_fold_reads -min-bits 4096");
+					run("memory_async2sync -min-bits 1024 -max-ports 20");
+				}
 				run("memory_collect");
 			}
 			std::string args = "";

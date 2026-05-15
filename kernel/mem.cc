@@ -1166,7 +1166,20 @@ void Mem::emulate_transparency(int widx, int ridx, FfInitVals *initvals) {
 	// the mux whenever this would be relevant.  It does, however, need to have the same
 	// clock enable signal as the read port.
 	SigSpec wdata_q = module->addWire(NEW_ID, GetSize(wport.data));
-	module->addDffe(NEW_ID, rport.clk, rport.en, wport.data, wdata_q, rport.clk_polarity, true);
+	// R22: mark DFFE so opt_dff doesn't strip its CE even when CE is
+	// constantly active (forces PROD to keep DFFRE matching V3 structure).
+	// 2026-05-15: runtime gate. Set YOSYS_R22_DISABLE=1 to skip the attribute
+	// (downstream R24 in ff.cc and R22 in opt_dff.cc then never see the tag,
+	// reverting to upstream CE-strip behavior).
+	Cell *_wdata_dffe = module->addDffe(NEW_ID, rport.clk, rport.en, wport.data, wdata_q, rport.clk_polarity, true);
+	{
+		static const bool r22_disabled = []() {
+			const char *v = getenv("YOSYS_R22_DISABLE");
+			return v && v[0] && std::string(v) != "0";
+		}();
+		if (!r22_disabled)
+			_wdata_dffe->set_bool_attribute(ID(memory_transparency_data));
+	}
 	for (int sub = 0; sub < (1 << max_wide_log2); sub += (1 << min_wide_log2)) {
 		SigSpec raddr = rport.addr;
 		SigSpec waddr = wport.addr;
@@ -1646,10 +1659,31 @@ void Mem::emulate_read_first(FfInitVals *initvals) {
 		FfData ff_data(module, initvals, NEW_ID);
 		FfData ff_addr(module, initvals, NEW_ID);
 		FfData ff_en(module, initvals, NEW_ID);
+		// R34 (2026-05-14): CE-gate the data/addr/en buffer flops.
+		// Original (upstream) emitted plain $dff (no CE), creating a CE-less
+		// broadcast DFF feeding all replica SDPB.DI[*]. R32's CE-gating proved
+		// the design stays alive (vs R33's full-skip which dead-locked).
+		// Use ReduceOr of write-enable bits as the CE: buffer only updates on
+		// cycles when a write is actually happening, mirroring V3_N17_GOOD's
+		// implicit (no buffer) behavior more closely.
+		// 2026-05-15: runtime gate. Set YOSYS_R34_DISABLE=1 to bypass the
+		// CE-gating and emit plain $dff (upstream behavior).
+		static const bool r34_disabled = []() {
+			const char *v = getenv("YOSYS_R34_DISABLE");
+			return v && v[0] && std::string(v) != "0";
+		}();
+		SigSpec ce_sig;
+		if (!r34_disabled)
+			ce_sig = module->ReduceOr(NEW_ID, compressed.first);
 		ff_data.width = GetSize(port.data);
 		ff_data.has_clk = true;
 		ff_data.sig_clk = port.clk;
 		ff_data.pol_clk = port.clk_polarity;
+		if (!r34_disabled) {
+			ff_data.has_ce = true;
+			ff_data.sig_ce = ce_sig;
+			ff_data.pol_ce = true;
+		}
 		ff_data.sig_d = port.data;
 		ff_data.sig_q = new_data;;
 		ff_data.val_init = Const(State::Sx, ff_data.width);
@@ -1658,6 +1692,11 @@ void Mem::emulate_read_first(FfInitVals *initvals) {
 		ff_addr.has_clk = true;
 		ff_addr.sig_clk = port.clk;
 		ff_addr.pol_clk = port.clk_polarity;
+		if (!r34_disabled) {
+			ff_addr.has_ce = true;
+			ff_addr.sig_ce = ce_sig;
+			ff_addr.pol_ce = true;
+		}
 		ff_addr.sig_d = port.addr;
 		ff_addr.sig_q = new_addr;;
 		ff_addr.val_init = Const(State::Sx, ff_addr.width);

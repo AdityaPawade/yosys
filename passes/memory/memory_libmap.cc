@@ -219,6 +219,17 @@ struct MemMapping {
 		}
 		assign_wr_ports();
 		assign_rd_ports();
+		// 2026-05-15: runtime gate. Set YOSYS_R41_DISABLE=1 to skip
+		// apply_no_rw_check() and let handle_trans() see the unmasked
+		// collision settings (upstream behavior).
+		{
+			static const bool r41_disabled = []() {
+				const char *v = getenv("YOSYS_R41_DISABLE");
+				return v && v[0] && std::string(v) != "0";
+			}();
+			if (!r41_disabled)
+				apply_no_rw_check();
+		}
 		handle_trans();
 		// If we got this far, the memory is mappable.  The following two can require emulating
 		// some functionality, but cannot cause the mapping to fail.
@@ -303,6 +314,8 @@ struct MemMapping {
 	bool check_ram_kind(const Ram &ram);
 	bool check_ram_style(const Ram &ram);
 	bool check_init(const Ram &ram);
+	bool has_no_rw_check();
+	void apply_no_rw_check();
 	void assign_wr_ports();
 	void assign_rd_ports();
 	void handle_trans();
@@ -685,6 +698,53 @@ bool apply_clock(MemConfig &cfg, const PortVariant &def, SigBit clk, bool clk_po
 			return true;
 		} else {
 			return ccfg.clk == clk && ccfg.invert == invert;
+		}
+	}
+}
+
+// R41 (Codex thread, 2026-05-14): honor `no_rw_check` BEFORE handle_trans.
+// V3_N17_GOOD has zero emulate_read_first cells because its collision masks
+// were set to don't-care by an earlier pass. In current PROD synth flow,
+// the masks are not propagated correctly into MemMapping, so libmap's
+// emulate_read_first_ok() returns true → adds the emu_read_first variant →
+// libmap picks it → emit() inserts CE-less buffer DFFs that desync the
+// FSM's same-cycle capture path (probe_expected) from the BSRAM write.
+// This method explicitly applies the no_rw_check attribute right before
+// handle_trans() so emulate_read_first_ok() sees collision_x_mask=true on
+// every rd/wr port pair → returns false → no emu_read_first variant.
+bool MemMapping::has_no_rw_check()
+{
+	auto find_attr = search_for_attribute(mem, ID(no_rw_check));
+	if (find_attr.first && find_attr.second.as_bool())
+		return true;
+
+	for (auto attr: {ID(ram_block), ID(rom_block), ID(ram_style), ID(rom_style),
+			ID(ramstyle), ID(romstyle), ID(syn_ramstyle), ID(syn_romstyle)}) {
+		find_attr = search_for_attribute(mem, attr);
+		if (!find_attr.first)
+			continue;
+		std::string val_s = find_attr.second.decode_string();
+		for (auto &c: val_s)
+			c = std::tolower(c);
+		if (val_s == "no_rw_check")
+			return true;
+	}
+
+	return false;
+}
+
+void MemMapping::apply_no_rw_check()
+{
+	if (!has_no_rw_check())
+		return;
+
+	log("found no_rw_check on memory %s.%s, marking read/write collisions as don't-care before libmap\n",
+			log_id(mem.module->name), log_id(mem.memid));
+
+	for (auto &rport: mem.rd_ports) {
+		for (int wpidx = 0; wpidx < GetSize(mem.wr_ports); wpidx++) {
+			rport.transparency_mask[wpidx] = false;
+			rport.collision_x_mask[wpidx] = true;
 		}
 	}
 }
