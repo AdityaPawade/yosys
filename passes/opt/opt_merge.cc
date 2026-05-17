@@ -264,6 +264,22 @@ struct OptMergeThreadWorker
 		return !initvals(cell->getPort(ID::Q)).is_fully_def();
 	}
 
+	bool has_keep_output(const RTLIL::Cell *cell) const
+	{
+		for (auto &conn : cell->connections()) {
+			if (!cell->output(conn.first))
+				continue;
+			for (SigBit bit : conn.second) {
+				if (bit.wire && bit.wire->get_bool_attribute(ID::keep))
+					return true;
+				SigBit mapped_bit = assign_map(bit);
+				if (mapped_bit.wire && mapped_bit.wire->get_bool_attribute(ID::keep))
+					return true;
+			}
+		}
+		return false;
+	}
+
 	OptMergeThreadWorker(const RTLIL::Module *module, const FfInitVals &initvals,
 			const SigMap &assign_map, const CellTypes &ct, int workers,
 			bool mode_share_all, bool mode_keepdc) :
@@ -287,6 +303,8 @@ struct OptMergeThreadWorker
 			if (cell->type == ID($scopeinfo))
 				continue;
 			if (mode_keepdc && has_dont_care_initval(cell))
+				continue;
+			if (cell->has_keep_attr() || has_keep_output(cell))
 				continue;
 			if (!cell->known())
 				continue;
