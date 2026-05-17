@@ -55,13 +55,14 @@ struct MemoryAsync2SyncWorker {
 	Module *module;
 	int min_bits;
 	int max_ports;
+	bool gowin_strict_bram_async;
 	pool<IdString> only_mem;
 
 	int memories_transformed = 0;
 	int ports_transformed = 0;
 
-	MemoryAsync2SyncWorker(Module *m, int mb, int mp, pool<IdString> om)
-		: module(m), min_bits(mb), max_ports(mp), only_mem(om) {}
+	MemoryAsync2SyncWorker(Module *m, int mb, int mp, bool gsba, pool<IdString> om)
+		: module(m), min_bits(mb), max_ports(mp), gowin_strict_bram_async(gsba), only_mem(om) {}
 
 	// Find a clock signal we can use to register an async port. Strategy:
 	//   1. If any write port is clocked, take its clk + polarity.
@@ -87,6 +88,20 @@ struct MemoryAsync2SyncWorker {
 		return false;
 	}
 
+	bool is_forced_block_ram(const Mem &mem)
+	{
+		Const ram_style, syn_ramstyle;
+		if (mem.attributes.count(ID::ram_style))
+			ram_style = mem.attributes.at(ID::ram_style);
+		if (mem.attributes.count(ID::syn_ramstyle))
+			syn_ramstyle = mem.attributes.at(ID::syn_ramstyle);
+
+		std::string rs = ram_style.decode_string();
+		std::string srs = syn_ramstyle.decode_string();
+		return rs == "block" || rs == "block_ram" ||
+		       srs == "block" || srs == "block_ram";
+	}
+
 	void run()
 	{
 		std::vector<Mem> memories = Mem::get_all_memories(module);
@@ -102,16 +117,22 @@ struct MemoryAsync2SyncWorker {
 
 			if (!wanted) continue;
 
+			bool forced_block_ram = is_forced_block_ram(mem);
+
 			// Skip memories with very high port count — promoting them all to
 			// sync overwhelms memory_libmap's per-port analysis (OOMs Pi 5).
-			// Without promotion they just stay in FF mapping (no worse than
-			// today).
+			// Forced block RAM is exempt: it cannot legally fall back to async
+			// FF/LUT semantics in the Gowin flow, and the forced-block libmap
+			// byte-replica path now bounds per-port expansion deterministically.
 			int total_ports = (int)mem.rd_ports.size() + (int)mem.wr_ports.size();
-			if (max_ports > 0 && total_ports > max_ports) {
+			if (max_ports > 0 && total_ports > max_ports && !forced_block_ram) {
 				log("skipping memory %s.%s: %d ports > -max-ports %d.\n",
 					log_id(module), log_id(mem.memid), total_ports, max_ports);
 				continue;
 			}
+			if (max_ports > 0 && total_ports > max_ports && forced_block_ram)
+				log("not applying -max-ports %d to forced block RAM %s.%s with %d ports.\n",
+					max_ports, log_id(module), log_id(mem.memid), total_ports);
 
 			// Skip memories with no async read ports (already fully sync).
 			bool any_async = false;
@@ -123,6 +144,17 @@ struct MemoryAsync2SyncWorker {
 			SigSpec clk;
 			bool clk_polarity = true;
 			if (!find_clock(mem, clk, clk_polarity)) {
+				if (gowin_strict_bram_async && forced_block_ram) {
+					int async_ports = 0;
+					for (auto &rd : mem.rd_ports)
+						if (!rd.clk_enable)
+							async_ports++;
+					log_error("Gowin block RAM memory %s.%s has %d asynchronous read port(s) "
+					          "but no clock is available for memory_async2sync promotion. "
+					          "Refusing to leave forced block RAM with async-read semantics; "
+					          "register the read path in RTL or map to a true async-read resource.\n",
+					          log_id(module), log_id(mem.memid), async_ports);
+				}
 				log("memory %s.%s has async read ports but no clock available; "
 					"skipping.\n", log_id(module), log_id(mem.memid));
 				continue;
@@ -231,6 +263,11 @@ struct MemoryAsync2SyncPass : public Pass {
 		log("  -only-mem name1,name2,...\n");
 		log("    Comma-separated list of memory names to transform.  Overrides -min-bits.\n");
 		log("\n");
+		log("  -gowin-strict-bram-async\n");
+		log("    For block-RAM-forced memories with asynchronous read ports, require\n");
+		log("    successful promotion to synchronous ports. Error out instead of leaving\n");
+		log("    Gowin BSRAM-resident memories with unmappable async-read semantics.\n");
+		log("\n");
 	}
 
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
@@ -239,6 +276,7 @@ struct MemoryAsync2SyncPass : public Pass {
 
 		int min_bits = 1024;
 		int max_ports = 0;  // 0 = unlimited
+		bool gowin_strict_bram_async = false;
 		pool<IdString> only_mem;
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
@@ -248,6 +286,10 @@ struct MemoryAsync2SyncPass : public Pass {
 			}
 			if (args[argidx] == "-max-ports" && argidx + 1 < args.size()) {
 				max_ports = atoi(args[++argidx].c_str());
+				continue;
+			}
+			if (args[argidx] == "-gowin-strict-bram-async") {
+				gowin_strict_bram_async = true;
 				continue;
 			}
 			if (args[argidx] == "-only-mem" && argidx + 1 < args.size()) {
@@ -272,7 +314,7 @@ struct MemoryAsync2SyncPass : public Pass {
 
 		int total_mems = 0, total_ports = 0;
 		for (auto mod : design->selected_modules()) {
-			MemoryAsync2SyncWorker worker(mod, min_bits, max_ports, only_mem);
+			MemoryAsync2SyncWorker worker(mod, min_bits, max_ports, gowin_strict_bram_async, only_mem);
 			worker.run();
 			total_mems += worker.memories_transformed;
 			total_ports += worker.ports_transformed;

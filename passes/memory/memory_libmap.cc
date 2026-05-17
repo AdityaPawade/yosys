@@ -44,6 +44,38 @@ struct PassOptions {
 	double logic_cost_ram;
 };
 
+static bool gowin_sdp_width_legal(int width)
+{
+	switch (width) {
+	case 1:
+	case 2:
+	case 4:
+	case 8:
+	case 9:
+	case 16:
+	case 18:
+	case 32:
+	case 36:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int gowin_sdp_width_ceil(int width)
+{
+	if (width <= 1) return 1;
+	if (width <= 2) return 2;
+	if (width <= 4) return 4;
+	if (width <= 8) return 8;
+	if (width <= 9) return 9;
+	if (width <= 16) return 16;
+	if (width <= 18) return 18;
+	if (width <= 32) return 32;
+	if (width <= 36) return 36;
+	return width;
+}
+
 struct WrPortConfig {
 	// Index of the read port this port is merged with, or -1 if none.
 	int rd_port;
@@ -218,7 +250,8 @@ struct MemMapping {
 			cfgs.push_back(cfg);
 		}
 		assign_wr_ports();
-		assign_rd_ports();
+		if (!assign_gowin_forced_block_byte_replicas_rd_ports())
+			assign_rd_ports();
 		// 2026-05-15: runtime gate. Set YOSYS_R41_DISABLE=1 to skip
 		// apply_no_rw_check() and let handle_trans() see the unmasked
 		// collision settings (upstream behavior).
@@ -317,12 +350,16 @@ struct MemMapping {
 	bool has_no_rw_check();
 	void apply_no_rw_check();
 	void assign_wr_ports();
+	bool assign_gowin_forced_block_byte_replicas_rd_ports();
 	void assign_rd_ports();
 	void handle_trans();
 	void handle_priority();
 	void handle_rd_rst();
 	void score_emu_ports();
 	void handle_geom();
+	bool force_gowin_forced_block_byte_replicas(const MemConfig &cfg);
+	bool handle_gowin_forced_block_byte_replicas_geom(MemConfig &cfg, int max_wide_log2,
+			const std::vector<int> &wren_size);
 	void prune_post_geom();
 	void emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, const PortVariant &pdef, const char *name, int wpidx, int rpidx, const std::vector<int> &hw_addr_swizzle);
 	void emit(const MemConfig &cfg);
@@ -798,6 +835,100 @@ void MemMapping::assign_wr_ports() {
 	}
 }
 
+bool MemMapping::assign_gowin_forced_block_byte_replicas_rd_ports()
+{
+	if (kind != RamKind::Block)
+		return false;
+	if (mem.width != 8)
+		return false;
+	if (GetSize(mem.wr_ports) == 0 || GetSize(mem.rd_ports) <= 1)
+		return false;
+
+	bool any_sync_read = false;
+	for (auto &port: mem.rd_ports)
+		if (port.clk_enable)
+			any_sync_read = true;
+	if (!any_sync_read)
+		return false;
+
+	for (auto &cfg: cfgs) {
+		if (cfg.def->id != RTLIL::escape_id("$__GOWIN_SDP_"))
+			continue;
+		if (cfg.def->kind != RamKind::Block)
+			continue;
+		if (cfg.def->width_mode != WidthMode::PerPort)
+			continue;
+		if (cfg.def->byte != 8)
+			continue;
+
+		for (int pgi = 0; pgi < GetSize(cfg.def->port_groups); pgi++) {
+			auto &pg = cfg.def->port_groups[pgi];
+
+			int used_by_writes = 0;
+			for (auto &wpcfg: cfg.wr_ports)
+				if (wpcfg.port_group == pgi)
+					used_by_writes++;
+			if (used_by_writes >= GetSize(pg.names))
+				continue;
+
+			for (int pvi = 0; pvi < GetSize(pg.variants); pvi++) {
+				auto &def = pg.variants[pvi];
+				if (def.kind == PortKind::Sw)
+					continue;
+
+				MemConfig new_cfg = cfg;
+				bool ok = true;
+
+				for (int rpidx = 0; rpidx < GetSize(mem.rd_ports); rpidx++) {
+					auto &port = mem.rd_ports[rpidx];
+
+					if (!port.clk_enable) {
+						if (def.kind == PortKind::Sr || def.kind == PortKind::Srsw) {
+							ok = false;
+							break;
+						}
+					}
+
+					RdPortConfig pcfg;
+					pcfg.wr_port = -1;
+					pcfg.port_group = pgi;
+					pcfg.port_variant = pvi;
+					pcfg.def = &def;
+
+					if (def.kind == PortKind::Sr || def.kind == PortKind::Srsw) {
+						pcfg.emu_sync = false;
+						if (!apply_clock(new_cfg, def, port.clk, port.clk_polarity)) {
+							ok = false;
+							break;
+						}
+						if (port.en != State::S1) {
+							if (def.clk_en)
+								pcfg.rd_en_to_clk_en = true;
+							else
+								pcfg.emu_en = !def.rd_en;
+						}
+					} else {
+						pcfg.emu_sync = port.clk_enable;
+					}
+
+					new_cfg.rd_ports.push_back(pcfg);
+				}
+
+				if (!ok)
+					continue;
+
+				cfgs.clear();
+				cfgs.push_back(new_cfg);
+				log("memory %s.%s: forced Gowin 8-bit block RAM: bounded read-port assignment for %d reads\n",
+						log_id(mem.module->name), log_id(mem.memid), GetSize(mem.rd_ports));
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 // Perform read port assignment, validating clock and rden options as we go.
 void MemMapping::assign_rd_ports() {
 	log_reject(stringf("Assigning read ports... (candidate configs: %zu)", (size_t) cfgs.size()));
@@ -1246,6 +1377,101 @@ void MemMapping::score_emu_ports() {
 	}
 }
 
+bool MemMapping::force_gowin_forced_block_byte_replicas(const MemConfig &cfg)
+{
+	if (kind != RamKind::Block)
+		return false;
+	if (cfg.def->kind != RamKind::Block)
+		return false;
+	if (cfg.def->width_mode != WidthMode::PerPort)
+		return false;
+	if (cfg.def->byte != 8)
+		return false;
+	if (mem.width != 8)
+		return false;
+	if (GetSize(mem.wr_ports) == 0 || GetSize(mem.rd_ports) <= 1)
+		return false;
+
+	// Gowin forced block-RAM sector buffers with many same-cycle byte reads
+	// must duplicate the 8-bit SDP read lane.  Letting libmap choose a wider
+	// base width or hard-wide bits packs byte lanes into fewer SDPB cells,
+	// which breaks the intended multi-read replication contract.
+	for (auto &port: mem.rd_ports)
+		if (port.clk_enable)
+			return true;
+
+	return false;
+}
+
+bool MemMapping::handle_gowin_forced_block_byte_replicas_geom(MemConfig &cfg, int max_wide_log2,
+		const std::vector<int> &wren_size)
+{
+	if (!force_gowin_forced_block_byte_replicas(cfg))
+		return false;
+
+	int base_width_log2 = -1;
+	for (int i = 0; i < GetSize(cfg.def->dbits); i++) {
+		if (cfg.def->dbits[i] == mem.width) {
+			base_width_log2 = i;
+			break;
+		}
+	}
+
+	if (base_width_log2 < 0)
+		return false;
+
+	log_assert(mem.width == 8);
+
+	cfg.base_width_log2 = base_width_log2;
+	cfg.unit_width_log2 = base_width_log2;
+	cfg.swizzle.clear();
+	for (int i = 0; i < mem.width; i++)
+		cfg.swizzle.push_back(i);
+
+	cfg.hard_wide_mask = 0;
+	cfg.emu_wide_mask = (1 << max_wide_log2) - 1;
+
+	int unit_width = cfg.def->dbits[cfg.unit_width_log2];
+	int emu_wide_bits = max_wide_log2;
+	int mult_wide = 1 << emu_wide_bits;
+	int addrs = 1 << (cfg.def->abits - cfg.base_width_log2 + emu_wide_bits);
+	int min_addr = mem.start_offset / addrs;
+	int max_addr = (mem.start_offset + mem.size - 1) / addrs;
+	int mult_a = max_addr - min_addr + 1;
+	int bits = mult_a * mult_wide * GetSize(cfg.swizzle);
+
+	cfg.repl_d = (bits + unit_width - 1) / unit_width;
+
+	int score_demux = 0;
+	for (int i = 0; i < GetSize(mem.wr_ports); i++) {
+		auto &port = mem.wr_ports[i];
+		int w = emu_wide_bits - port.wide_log2;
+		if (w || mult_a != 1)
+			score_demux += (mult_a << w) * wren_size[i];
+	}
+
+	int score_mux = 0;
+	for (auto &port: mem.rd_ports) {
+		int w = emu_wide_bits - port.wide_log2;
+		score_mux += ((mult_a << w) - 1) * GetSize(port.data);
+	}
+
+	cfg.score_demux = score_demux;
+	cfg.score_mux = score_mux;
+
+	double cost = (cfg.def->cost - cfg.def->widthscale) * cfg.repl_d * cfg.repl_port;
+	cost += cfg.def->widthscale * mult_a * mult_wide * mem.width / unit_width * cfg.repl_port;
+	cost += score_mux * FACTOR_MUX;
+	cost += score_demux * FACTOR_DEMUX;
+	cost += cfg.score_emu * FACTOR_EMU;
+	cfg.cost = cost;
+
+	log("memory %s.%s: forced Gowin 8-bit block geometry: repl_port=%d repl_d=%d\n",
+			log_id(mem.module->name), log_id(mem.memid), cfg.repl_port, cfg.repl_d);
+
+	return true;
+}
+
 void MemMapping::handle_geom() {
 	std::vector<int> wren_size;
 	for (auto &port: mem.wr_ports) {
@@ -1298,6 +1524,13 @@ void MemMapping::handle_geom() {
 		for (auto &port: mem.rd_ports)
 			if (port.wide_log2 > max_wide_log2)
 				max_wide_log2 = port.wide_log2;
+		bool force_byte_replicas = force_gowin_forced_block_byte_replicas(cfg);
+		if (force_byte_replicas) {
+			for (int bit = 0; bit < max_wide_log2; bit++)
+				no_wide_bits.insert(bit);
+		}
+		if (handle_gowin_forced_block_byte_replicas_geom(cfg, max_wide_log2, wren_size))
+			continue;
 		int wide_nu_start = max_wide_log2;
 		int wide_nu_end = max_wr_wide_log2;
 		for (int i = 0; i < GetSize(mem.wr_ports); i++) {
@@ -1346,6 +1579,8 @@ void MemMapping::handle_geom() {
 		}
 		// Iterate over base widths.
 		for (int base_width_log2 = 0; base_width_log2 < GetSize(cfg.def->dbits); base_width_log2++) {
+			if (force_byte_replicas && cfg.def->dbits[base_width_log2] != mem.width)
+				continue;
 			// Now, see how many data bits we actually have available.
 			// This is usually dbits[base_width_log2], but could be smaller if we
 			// ran afoul of a max width limitation.  Configurations where this
@@ -1855,15 +2090,32 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 		if (rpidx == -1)
 			hw_rd_wide_log2 = pdef.max_rd_wide_log2;
 	}
+
+	int hw_wr_width = cfg.def->dbits[hw_wr_wide_log2];
+	int hw_rd_width = cfg.def->dbits[hw_rd_wide_log2];
+
+	// Gowin BSRAM only has physical SDP data widths
+	// {1,2,4,8,9,16,18,32,36}.  memory_share/memory_fold_reads can
+	// legitimately create a fused read lane whose live-bit count is not one
+	// of those physical widths, for example 15 or 29 bits for multi-read
+	// sector buffers.  Keep the libmap swizzle unchanged, but allocate the
+	// next legal physical container width and leave the padded high bits
+	// unused.  This keeps storage in BSRAM and prevents illegal BIT_WIDTH_*
+	// parameters from reaching the Gowin techmap/apicula packer.
+	if (cfg.def->id == RTLIL::escape_id("$__GOWIN_SDP_")) {
+		hw_wr_width = gowin_sdp_width_ceil(hw_wr_width);
+		hw_rd_width = gowin_sdp_width_ceil(hw_rd_width);
+	}
+
 	if (cfg.def->width_mode == WidthMode::PerPort) {
 		for (auto cell: cells) {
 			if (pdef.width_tied) {
-				cell->setParam(stringf("\\PORT_%s_WIDTH", name), cfg.def->dbits[hw_wr_wide_log2]);
+				cell->setParam(stringf("\\PORT_%s_WIDTH", name), hw_wr_width);
 			} else {
 				if (pdef.kind != PortKind::Ar && pdef.kind != PortKind::Sr)
-					cell->setParam(stringf("\\PORT_%s_WR_WIDTH", name), cfg.def->dbits[hw_wr_wide_log2]);
+					cell->setParam(stringf("\\PORT_%s_WR_WIDTH", name), hw_wr_width);
 				if (pdef.kind != PortKind::Sw)
-					cell->setParam(stringf("\\PORT_%s_RD_WIDTH", name), cfg.def->dbits[hw_rd_wide_log2]);
+					cell->setParam(stringf("\\PORT_%s_RD_WIDTH", name), hw_rd_width);
 			}
 		}
 	}
@@ -1883,7 +2135,7 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 
 	// Write part.
 	if (pdef.kind != PortKind::Ar && pdef.kind != PortKind::Sr) {
-		int width = cfg.def->dbits[hw_wr_wide_log2];
+		int width = hw_wr_width;
 		int effective_byte = cfg.def->byte;
 		if (effective_byte == 0 || effective_byte > width)
 			effective_byte = width;
@@ -1944,7 +2196,7 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 
 	// Read part.
 	if (pdef.kind != PortKind::Sw) {
-		int width = cfg.def->dbits[hw_rd_wide_log2];
+		int width = hw_rd_width;
 		if (rpidx != -1) {
 			auto &rport = mem.rd_ports[rpidx];
 			auto &rpcfg = cfg.rd_ports[rpidx];
@@ -1970,7 +2222,12 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 							val = rport.srst_value;
 						}
 						std::vector<State> hw_val;
-						for (auto &bit : port_swz.bits[rd]) {
+						for (int i = 0; i < width; i++) {
+							if (i >= GetSize(port_swz.bits[rd])) {
+								hw_val.push_back(State::Sx);
+								continue;
+							}
+							auto &bit = port_swz.bits[rd][i];
 							if (!bit.valid) {
 								hw_val.push_back(State::Sx);
 							} else {
@@ -1983,7 +2240,12 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 					}
 					if (pdef.rdarstval == ResetValKind::Any || pdef.rdarstval == ResetValKind::NoUndef) {
 						std::vector<State> hw_val;
-						for (auto &bit : port_swz.bits[rd]) {
+						for (int i = 0; i < width; i++) {
+							if (i >= GetSize(port_swz.bits[rd])) {
+								hw_val.push_back(State::Sx);
+								continue;
+							}
+							auto &bit = port_swz.bits[rd][i];
 							if (!bit.valid) {
 								hw_val.push_back(State::Sx);
 							} else {
@@ -1996,7 +2258,12 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 					}
 					if (pdef.rdsrstval == ResetValKind::Any || pdef.rdsrstval == ResetValKind::NoUndef) {
 						std::vector<State> hw_val;
-						for (auto &bit : port_swz.bits[rd]) {
+						for (int i = 0; i < width; i++) {
+							if (i >= GetSize(port_swz.bits[rd])) {
+								hw_val.push_back(State::Sx);
+								continue;
+							}
+							auto &bit = port_swz.bits[rd][i];
 							if (!bit.valid) {
 								hw_val.push_back(State::Sx);
 							} else {
@@ -2013,6 +2280,8 @@ void MemMapping::emit_port(const MemConfig &cfg, std::vector<Cell*> &cells, cons
 				SigSpec lhs;
 				SigSpec rhs;
 				for (int i = 0; i < GetSize(hw_rdata); i++) {
+					if (i >= GetSize(port_swz.bits[rd]))
+						continue;
 					auto &bit = port_swz.bits[rd][i];
 					if (bit.valid) {
 						lhs.append(big_rdata[bit.mux_idx][bit.bit]);

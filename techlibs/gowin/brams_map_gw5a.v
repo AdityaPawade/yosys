@@ -358,123 +358,28 @@ wire WRE = PORT_W_CLK_EN & PORT_W_WR_EN;
 `define x8_native_width(w) (w == 8 || w == 16 || w == 32)
 `define x9_family_width(w) (w == 9 || w == 18 || w == 36)
 
+`define sdp_x8_ceil(w) ((w) <= 1 ? 1 : (w) <= 2 ? 2 : (w) <= 4 ? 4 : (w) <= 8 ? 8 : (w) <= 16 ? 16 : 32)
+`define sdp_x9_ceil(w) ((w) <= 9 ? 9 : (w) <= 18 ? 18 : 36)
+
+localparam PORT_W_X8_WIDTH = `sdp_x8_ceil(PORT_W_WIDTH);
+localparam PORT_R_X8_WIDTH = `sdp_x8_ceil(PORT_R_WIDTH);
+localparam PORT_W_X9_WIDTH = `sdp_x9_ceil(PORT_W_WIDTH);
+localparam PORT_R_X9_WIDTH = `sdp_x9_ceil(PORT_R_WIDTH);
+
 generate
 
-if (`x8_native_width(PORT_W_WIDTH) && `x8_native_width(PORT_R_WIDTH)) begin
-	// Native SDPB at widths 8/16/32.
-	//
-	// 2026-05-12 (Codex thread 019e1b34 Phase 14): when memory_widen_mixed
-	// produces a 32-bit write port WITH BYTE ENABLES (PORT_W_WR_BE_WIDTH > 1),
-	// we must configure SDPB ASYMMETRICALLY (BIT_WIDTH_0=8 byte write,
-	// BIT_WIDTH_1=PORT_R_WIDTH word read).  SDPB has no native byte-enable
-	// on a symmetric 32x32 configuration — a 32-bit write overwrites all 4
-	// bytes, zeroing the 3 bytes outside the lane we intended to write.
-	// That's the "51 00 00 49 42 FF FF" garbage we saw on OLED in Day-8.
-	//
-	// Asymmetric SDPB: the cell stores depth*8 bits with byte-wise writes
-	// to an 11-bit address (byte_addr = word_addr * (R_W/8) + byte_idx) and
-	// 32-bit (or wider) reads at a 9-bit address (word_addr).
-	//
-	// byte_idx priority-encoded from PORT_W_WR_BE (assumed one-hot per cycle —
-	// memory_widen_mixed produces one-hot byte enables for original 8-bit
-	// writers, which is our case).
-	//
-	// OCE tied GND to match Gowin reference (READ_MODE=0 bypass).
-	// RESET tied GND to match Gowin reference (read output is combinational
-	// off the BSRAM array, no register to reset).
-	if (PORT_W_WIDTH == 32 && PORT_W_WR_BE_WIDTH == 4) begin
-		// memory_widen_mixed output: 32-bit byte-enabled write, 32-bit read.
-		//
-		// 2026-05-12 (Phase 15): correct ADA packing.  yosys libmap places the
-		// word address LEFT-ALIGNED in PORT_W_ADDR (word_addr at PORT_W_ADDR[11:5]
-		// to keep the bottom 5 bits available for byte-position-within-word).
-		// SDPB at BIT_WIDTH_0=8 uses ADA[13:3] as the byte address (lower 3 bits
-		// are within-byte and ignored).  So byte_addr (= word_addr*4 + byte_idx)
-		// must land at ADA[13:3]: word_addr at ADA[11:5] (already there from
-		// PORT_W_ADDR), byte_idx at ADA[4:3].  We OR byte_idx<<3 into PORT_W_ADDR.
-		// Phase-14 packed `{PORT_W_ADDR[11:0], byte_idx[1:0]}` which put byte_idx
-		// at ADA[1:0] — OUTSIDE the BIT_WIDTH=8 address window — making all 4
-		// bytes of a word collide to the same cell address.  That's the Day-9
-		// hardware-garbage cause.
-		wire [1:0] byte_idx = PORT_W_WR_BE[3] ? 2'd3 :
-		                      PORT_W_WR_BE[2] ? 2'd2 :
-		                      PORT_W_WR_BE[1] ? 2'd1 : 2'd0;
-		wire WRE_any = PORT_W_CLK_EN & PORT_W_WR_EN & (|PORT_W_WR_BE);
-		wire [13:0] ADA_byte = PORT_W_ADDR | {9'b0, byte_idx, 3'b000};
-		wire [7:0]  DI_byte = byte_idx == 2'd3 ? PORT_W_WR_DATA[31:24] :
-		                      byte_idx == 2'd2 ? PORT_W_WR_DATA[23:16] :
-		                      byte_idx == 2'd1 ? PORT_W_WR_DATA[15:8]  :
-		                                         PORT_W_WR_DATA[7:0];
-		wire [31:0] DO_word;
-		assign PORT_R_RD_DATA = DO_word[PORT_R_WIDTH-1:0];
+if (`x9_family_width(PORT_W_WIDTH) || `x9_family_width(PORT_R_WIDTH)) begin
 
-		SDPB #(
-			`INIT(init_slice_x8)
-			.READ_MODE(1'b0),
-			.BIT_WIDTH_0(8),
-			.BIT_WIDTH_1(PORT_R_WIDTH),
-			.BLK_SEL_0(3'b000),
-			.BLK_SEL_1(3'b000),
-			.RESET_MODE(OPTION_RESET_MODE),
-		) _TECHMAP_REPLACE_ (
-			.BLKSELA(3'b000),
-			.BLKSELB(3'b000),
-			.CLKA(PORT_W_CLK),
-			.CEA(WRE_any),
-			.ADA(ADA_byte),
-			.DI({24'b0, DI_byte}),
-			.CLKB(PORT_R_CLK),
-			.CEB(1'b1),         // Phase-12: defeat opt_dff CEB folding
-			.RESET(1'b0),       // Phase-14: match Gowin RESET=GND (no read reset needed at READ_MODE=0)
-			.OCE(1'b0),         // Phase-14: match Gowin OCE=GND
-			.ADB(PORT_R_ADDR),
-			.DO(DO_word),
-		);
-	end else begin
-		// Symmetric SDPB at native widths 8/16/32 (no byte enables).
-		wire [31:0] DI;
-		wire [31:0] DO;
-		if (PORT_W_WIDTH == 32) assign DI = PORT_W_WR_DATA;
-		else if (PORT_W_WIDTH == 16) assign DI = {16'b0, PORT_W_WR_DATA};
-		else /* 8 */ assign DI = {24'b0, PORT_W_WR_DATA};
-		assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
+	wire [35:0] DI = PORT_W_WR_DATA;
+	wire [35:0] DO;
 
-		SDPB #(
-			`INIT(init_slice_x8)
-			.READ_MODE(1'b0),
-			.BIT_WIDTH_0(PORT_W_WIDTH),
-			.BIT_WIDTH_1(PORT_R_WIDTH),
-			.BLK_SEL_0(3'b000),
-			.BLK_SEL_1(3'b000),
-			.RESET_MODE(OPTION_RESET_MODE),
-		) _TECHMAP_REPLACE_ (
-			.BLKSELA(3'b000),
-			.BLKSELB(3'b000),
-			.CLKA(PORT_W_CLK),
-			.CEA(WRE),
-			.ADA(ADW),
-			.DI(DI),
-			.CLKB(PORT_R_CLK),
-			.CEB(1'b1),
-			.RESET(1'b0),       // Phase-14: match Gowin RESET=GND
-			.OCE(1'b0),         // Phase-14: match Gowin OCE=GND
-			.ADB(PORT_R_ADDR),
-			.DO(DO),
-		);
-	end
+	assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
 
-end else if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
-	// Narrow widths {1, 2, 4} — historical SDPB path with x8 transcoding.
-	wire [31:0] DI = `x8_wr_data(PORT_W_WR_DATA);
-	wire [31:0] DO;
-
-	assign PORT_R_RD_DATA = `x8_rd_data(DO);
-
-	SDPB #(
-		`INIT(init_slice_x8)
+	SDPX9B #(
+		`INIT(init_slice_x9)
 		.READ_MODE(1'b0),
-		.BIT_WIDTH_0(`x8_width(PORT_W_WIDTH)),
-		.BIT_WIDTH_1(`x8_width(PORT_R_WIDTH)),
+		.BIT_WIDTH_0(PORT_W_X9_WIDTH),
+		.BIT_WIDTH_1(PORT_R_X9_WIDTH),
 		.BLK_SEL_0(3'b000),
 		.BLK_SEL_1(3'b000),
 		.RESET_MODE(OPTION_RESET_MODE),
@@ -484,11 +389,11 @@ end else if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 
 		.CLKA(PORT_W_CLK),
 		.CEA(WRE),
-		.ADA(ADW),
+		.ADA(`addrbe(PORT_W_X9_WIDTH, PORT_W_ADDR, PORT_W_WR_BE)),
 		.DI(DI),
 
 		.CLKB(PORT_R_CLK),
-		.CEB(1'b1),
+		.CEB(PORT_R_CLK_EN),
 		.RESET(RST),
 		.OCE(1'b1),
 		.ADB(PORT_R_ADDR),
@@ -496,17 +401,17 @@ end else if (PORT_W_WIDTH < 9 || PORT_R_WIDTH < 9) begin
 	);
 
 end else begin
-	// 9-bit family widths {9, 18, 36} — SDPX9B native.
-	wire [35:0] DI = PORT_W_WR_DATA;
-	wire [35:0] DO;
 
-	assign PORT_R_RD_DATA = DO;
+	wire [31:0] DI = PORT_W_WR_DATA;
+	wire [31:0] DO;
 
-	SDPX9B #(
-		`INIT(init_slice_x9)
+	assign PORT_R_RD_DATA = DO[PORT_R_WIDTH-1:0];
+
+	SDPB #(
+		`INIT(init_slice_x8)
 		.READ_MODE(1'b0),
-		.BIT_WIDTH_0(PORT_W_WIDTH),
-		.BIT_WIDTH_1(PORT_R_WIDTH),
+		.BIT_WIDTH_0(PORT_W_X8_WIDTH),
+		.BIT_WIDTH_1(PORT_R_X8_WIDTH),
 		.BLK_SEL_0(3'b000),
 		.BLK_SEL_1(3'b000),
 		.RESET_MODE(OPTION_RESET_MODE),
@@ -516,7 +421,7 @@ end else begin
 
 		.CLKA(PORT_W_CLK),
 		.CEA(WRE),
-		.ADA(ADW),
+		.ADA(`addrbe(PORT_W_X8_WIDTH, PORT_W_ADDR, PORT_W_WR_BE)),
 		.DI(DI),
 
 		.CLKB(PORT_R_CLK),

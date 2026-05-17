@@ -346,7 +346,7 @@ struct SynthGowinPass : public ScriptPass
 						run("memory_fold_reads -min-bits 4096 -consensus");
 					else
 						run("memory_fold_reads -min-bits 4096");
-					run("memory_async2sync -min-bits 1024 -max-ports 20");
+					run("memory_async2sync -min-bits 1024 -max-ports 20 -gowin-strict-bram-async");
 				}
 				run("memory_collect");
 			}

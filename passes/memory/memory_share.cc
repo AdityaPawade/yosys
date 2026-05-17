@@ -37,6 +37,63 @@ struct MemoryShareWorker
 	bool flag_widen;
 	bool flag_sat;
 
+	std::pair<bool, Const> search_for_attribute(Mem &mem, IdString attr)
+	{
+		if (mem.has_attribute(attr))
+			return std::make_pair(true, mem.attributes.at(attr));
+
+		for (auto &port: mem.rd_ports)
+			if (port.has_attribute(attr))
+				return std::make_pair(true, port.attributes.at(attr));
+		for (auto &port: mem.wr_ports)
+			if (port.has_attribute(attr))
+				return std::make_pair(true, port.attributes.at(attr));
+
+		for (auto &port: mem.rd_ports)
+			for (SigBit bit: port.data)
+				if (bit.is_wire() && bit.wire->has_attribute(attr))
+					return std::make_pair(true, bit.wire->attributes.at(attr));
+		for (auto &port: mem.wr_ports)
+			for (SigBit bit: port.data)
+				if (bit.is_wire() && bit.wire->has_attribute(attr))
+					return std::make_pair(true, bit.wire->attributes.at(attr));
+
+		for (auto &port: mem.rd_ports)
+			for (SigBit bit: port.addr)
+				if (bit.is_wire() && bit.wire->has_attribute(attr))
+					return std::make_pair(true, bit.wire->attributes.at(attr));
+		for (auto &port: mem.wr_ports)
+			for (SigBit bit: port.addr)
+				if (bit.is_wire() && bit.wire->has_attribute(attr))
+					return std::make_pair(true, bit.wire->attributes.at(attr));
+
+		return std::make_pair(false, Const());
+	}
+
+	bool attr_forces_block_ram(Const val)
+	{
+		if (val == 1)
+			return true;
+
+		std::string val_s = val.decode_string();
+		for (auto &c: val_s)
+			c = std::tolower(c);
+
+		return val_s == "block" || val_s == "block_ram" || val_s == "ebr";
+	}
+
+	bool forced_block_ram(Mem &mem)
+	{
+		for (auto attr: {ID::ram_block, ID::rom_block, ID::ram_style, ID::rom_style,
+				ID::ramstyle, ID::romstyle, ID::syn_ramstyle, ID::syn_romstyle}) {
+			auto found = search_for_attribute(mem, attr);
+			if (found.first && attr_forces_block_ram(found.second))
+				return true;
+		}
+
+		return false;
+	}
+
 	// --------------------------------------------------
 	// Consolidate read ports that read the same address
 	// (or close enough to be merged to wide ports)
@@ -503,7 +560,13 @@ struct MemoryShareWorker
 		}
 
 		for (auto &mem : memories) {
-			while (consolidate_rd_by_addr(mem));
+			if (forced_block_ram(mem)) {
+				log("Skipping read-port by-address consolidation for forced block RAM %s.%s.\n",
+						log_id(module), log_id(mem.memid));
+			} else {
+				while (consolidate_rd_by_addr(mem));
+			}
+
 			while (consolidate_wr_by_addr(mem));
 		}
 

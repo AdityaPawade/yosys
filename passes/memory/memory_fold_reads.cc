@@ -22,10 +22,75 @@
 #include "kernel/sigtools.h"
 #include "kernel/mem.h"
 #include <queue>
+#include <cctype>
 #include <cstdlib>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
+
+// Forced-block-RAM detection (reused verbatim from the validated
+// memory_share.cc r10 helper, Codex thread 019e3484). memory_fold_reads
+// must NOT fold the distinct same-cycle read ports of a memory the user
+// forced to block RAM (ram_style="block" / syn_ramstyle="block_ram" /
+// ram_block): folding assumes mutual exclusion it does not prove, and
+// collapses N independent BSRAM reads into one SDPB that returns wrong
+// data on hardware (the PE00R00D200 / Fa200e85g00 root cause).
+static std::pair<bool, Const> mfr_search_for_attribute(Mem &mem, IdString attr)
+{
+	if (mem.has_attribute(attr))
+		return std::make_pair(true, mem.attributes.at(attr));
+
+	for (auto &port: mem.rd_ports)
+		if (port.has_attribute(attr))
+			return std::make_pair(true, port.attributes.at(attr));
+	for (auto &port: mem.wr_ports)
+		if (port.has_attribute(attr))
+			return std::make_pair(true, port.attributes.at(attr));
+
+	for (auto &port: mem.rd_ports)
+		for (SigBit bit: port.data)
+			if (bit.is_wire() && bit.wire->has_attribute(attr))
+				return std::make_pair(true, bit.wire->attributes.at(attr));
+	for (auto &port: mem.wr_ports)
+		for (SigBit bit: port.data)
+			if (bit.is_wire() && bit.wire->has_attribute(attr))
+				return std::make_pair(true, bit.wire->attributes.at(attr));
+
+	for (auto &port: mem.rd_ports)
+		for (SigBit bit: port.addr)
+			if (bit.is_wire() && bit.wire->has_attribute(attr))
+				return std::make_pair(true, bit.wire->attributes.at(attr));
+	for (auto &port: mem.wr_ports)
+		for (SigBit bit: port.addr)
+			if (bit.is_wire() && bit.wire->has_attribute(attr))
+				return std::make_pair(true, bit.wire->attributes.at(attr));
+
+	return std::make_pair(false, Const());
+}
+
+static bool mfr_attr_forces_block_ram(Const val)
+{
+	if (val == 1)
+		return true;
+
+	std::string val_s = val.decode_string();
+	for (auto &c: val_s)
+		c = std::tolower(c);
+
+	return val_s == "block" || val_s == "block_ram" || val_s == "ebr";
+}
+
+static bool mfr_forced_block_ram(Mem &mem)
+{
+	for (auto attr: {ID::ram_block, ID::rom_block, ID::ram_style, ID::rom_style,
+			ID::ramstyle, ID::romstyle, ID::syn_ramstyle, ID::syn_romstyle}) {
+		auto found = mfr_search_for_attribute(mem, attr);
+		if (found.first && mfr_attr_forces_block_ram(found.second))
+			return true;
+	}
+
+	return false;
+}
 
 struct MemoryFoldReadsWorker {
 	Module *module;
@@ -380,6 +445,13 @@ struct MemoryFoldReadsWorker {
 			if (!exclude_mem.empty() && memid_matches_exclude_mem(mem.memid)) {
 				log("memory_fold_reads: skipping %s.%s (matched -exclude-mem).\n",
 					log_id(module), log_id(mem.memid));
+				continue;
+			}
+			if (mfr_forced_block_ram(mem)) {
+				int active_rd = 0;
+				for (auto &rd : mem.rd_ports) if (!rd.removed) active_rd++;
+				log("memory_fold_reads: skipping forced block RAM %s.%s (%d ports remain).\n",
+					log_id(module), log_id(mem.memid), active_rd);
 				continue;
 			}
 			if (!only_mem.empty()) {
