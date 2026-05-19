@@ -420,7 +420,7 @@ CXXFLAGS += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --silence-e
 ifeq ($(OS), MINGW)
 CXXFLAGS += -Ilibs/dlfcn-win32
 endif
-LIBS += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --silence-errors --libs libffi || echo -lffi)
+LIBS += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --silence-errors --libs libffi || true)
 ifneq ($(OS), $(filter $(OS),FreeBSD OpenBSD NetBSD MINGW))
 LIBS += -ldl
 endif
