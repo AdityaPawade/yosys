@@ -628,10 +628,6 @@ struct MemoryFoldReadsPass : public Pass {
 		log("                        via the YOSYS_MEM_FOLD_CONSENSUS env var.\n");
 		log("\n");
 		log("Environment:\n");
-		log("    YOSYS_MEM_FOLD_AGGRESSIVE=1\n");
-		log("        Increase async active-signal search depth from 6 to 32 and preserve\n");
-		log("        skipped async ports (don't rewire their data into the survivor).\n");
-		log("        Off by default; backward-compatible.\n");
 		log("    YOSYS_MEM_FOLD_CONSENSUS=1\n");
 		log("        Same as -consensus (gates the new conservative selector).\n");
 		log("\n");
@@ -644,12 +640,13 @@ struct MemoryFoldReadsPass : public Pass {
 		int min_ports = 2;
 		pool<IdString> only_mem;
 		pool<IdString> exclude_mem;
-		const char *env_aggressive = getenv("YOSYS_MEM_FOLD_AGGRESSIVE");
-		bool aggressive = env_aggressive && env_aggressive[0] && std::string(env_aggressive) != "0";
-		int active_search_depth = aggressive ? 32 : 6;
-		if (aggressive)
-			log("memory_fold_reads: YOSYS_MEM_FOLD_AGGRESSIVE enabled; active-signal search depth is %d and skipped async ports are preserved.\n",
-				active_search_depth);
+		// YOSYS_MEM_FOLD_AGGRESSIVE experiment removed (2026-05-19 cleanup;
+		// was default-OFF, unused by any shipping build). Pinned to the
+		// env-unset default (aggressive=false, search depth 6) so all
+		// downstream behavior is byte-identical to the prior default.
+		// Skipped-port preservation stays UNCONDITIONAL (load-bearing fix).
+		bool aggressive = false;
+		int active_search_depth = 6;
 		// 2026-05-15: consensus mode. Pass arg `-consensus` and/or env var
 		// YOSYS_MEM_FOLD_CONSENSUS=1 enable conservative consensus-based
 		// active-signal selection (see ActiveCand and friends in worker).
